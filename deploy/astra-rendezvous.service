@@ -1,0 +1,15 @@
+[Unit]
+Description=Astra Gemini Rendezvous/Relay server
+After=network.target
+
+[Service]
+Type=simple
+User=astra
+WorkingDirectory=/opt/astra-gemini
+EnvironmentFile=/etc/astra-rendezvous.env
+ExecStart=/usr/bin/node src/rendezvous.mjs
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

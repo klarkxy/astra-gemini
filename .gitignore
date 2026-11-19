@@ -14,4 +14,5 @@ Thumbs.db
 join-token.txt
 nodes.json
 oauth-state.json
+identity.json
 notes/

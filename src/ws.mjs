@@ -62,7 +62,11 @@ export class MiniWebSocket extends EventEmitter {
     });
 
     if (initialBuffer && initialBuffer.length > 0) {
-      this._onData(initialBuffer);
+      socket.pause();
+      setImmediate(() => {
+        if (!this.closed) this._onData(initialBuffer);
+        socket.resume();
+      });
     }
   }
 
@@ -81,6 +85,11 @@ export class MiniWebSocket extends EventEmitter {
 
   sendJson(obj) {
     this.sendText(JSON.stringify(obj));
+  }
+
+  sendBinary(buf) {
+    if (this.closed) throw new Error("WebSocket is closed.");
+    this.socket.write(encodeFrame(0x2, Buffer.from(buf), this.isClient));
   }
 
   ping(data = "") {

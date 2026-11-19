@@ -12,6 +12,8 @@ import { loadSettings, saveSettings } from "./settings.mjs";
 import { checkEnvironment, createTunnelManager } from "./tunnel.mjs";
 import { createTreeManager, PROTOCOL_VERSION } from "./tree.mjs";
 import { createOAuthServer } from "./oauth.mjs";
+import { loadIdentity } from "./identity.mjs";
+import { createRemoteManager } from "./remote.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRIDGE_ROOT = path.resolve(__dirname, "..");
@@ -35,7 +37,7 @@ const TOOLS = [
       type: "object",
       required: ["project"],
       properties: {
-        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." },
+        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
         paths: { type: "array", items: { type: "string" }, description: "Optional glob/path filters for incremental pull." },
         knownHashes: {
           type: "object",
@@ -55,7 +57,7 @@ const TOOLS = [
       type: "object",
       required: ["project", "patch"],
       properties: {
-        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." },
+        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
         patch: { type: "string", description: "Unified diff patch content." },
         patchSha256: { type: "string", description: "Optional SHA-256 (or MD5) checksum of the patch text to verify transport integrity." },
         expectedHashes: {
@@ -74,7 +76,7 @@ const TOOLS = [
       type: "object",
       required: ["project"],
       properties: {
-        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." }
+        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." }
       }
     }
   },
@@ -86,7 +88,7 @@ const TOOLS = [
       type: "object",
       required: ["project", "script"],
       properties: {
-        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." },
+        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
         script: { type: "string", description: "Async JS body using `await sdk.<name>.<fn>(...)` (all sdk calls return Promises) and returning a compact summary." },
         timeoutMs: { type: "number", description: "Execution timeout in ms (default 30000, max 120000)." },
         maxOutputBytes: { type: "number", description: "Output/log cap in bytes (default 8192)." }
@@ -97,6 +99,29 @@ const TOOLS = [
 
 function sendJson(req, res, status, obj, extraHeaders = {}) {
   const rawBuf = Buffer.from(JSON.stringify(obj), "utf8");
+  const acceptEnc = String(req?.headers?.["accept-encoding"] || "");
+  if (rawBuf.length > 1024 && /\bgzip\b/i.test(acceptEnc)) {
+    const gz = zlib.gzipSync(rawBuf, { level: 6 });
+    res.writeHead(status, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Encoding": "gzip",
+      Vary: "Accept-Encoding",
+      "Content-Length": gz.length,
+      ...extraHeaders
+    });
+    res.end(gz);
+    return;
+  }
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": rawBuf.length,
+    ...extraHeaders
+  });
+  res.end(rawBuf);
+}
+
+function sendRaw(req, res, status, bodyText, extraHeaders = {}) {
+  const rawBuf = Buffer.from(String(bodyText), "utf8");
   const acceptEnc = String(req?.headers?.["accept-encoding"] || "");
   if (rawBuf.length > 1024 && /\bgzip\b/i.test(acceptEnc)) {
     const gz = zlib.gzipSync(rawBuf, { level: 6 });
@@ -210,10 +235,10 @@ export function createBridgeServer(options = {}) {
     let migrated = false;
     for (const [k, v] of Object.entries(raw)) {
       if (typeof v === "string") {
-        out[k] = { secretHash: v, canCallTree: false };
+        out[k] = { secretHash: v };
         migrated = true;
-      } else if (v && typeof v === "object") {
-        out[k] = { secretHash: typeof v.secretHash === "string" ? v.secretHash : "", canCallTree: Boolean(v.canCallTree) };
+      } else if (v && typeof v === "object" && typeof v.secretHash === "string") {
+        out[k] = { secretHash: v.secretHash };
       }
     }
     if (migrated) {
@@ -234,17 +259,8 @@ export function createBridgeServer(options = {}) {
     },
     set(nodeId, hash) {
       const all = loadNodeBindings();
-      const prev = all[nodeId];
-      all[nodeId] = { secretHash: hash, canCallTree: Boolean(prev?.canCallTree) };
+      all[nodeId] = { secretHash: hash };
       saveNodeBindings(all);
-    },
-    setGrant(nodeId, canCallTree) {
-      const all = loadNodeBindings();
-      const binding = all[nodeId];
-      if (!binding) return false;
-      binding.canCallTree = Boolean(canCallTree);
-      saveNodeBindings(all);
-      return true;
     },
     delete(nodeId) {
       const all = loadNodeBindings();
@@ -351,6 +367,87 @@ export function createBridgeServer(options = {}) {
     tree.connectUpstream(initialUpstream);
   }
 
+  async function handleMcp({ headers = {}, bodyText = "" } = {}) {
+    const respond = (status, obj, extraHeaders = {}) => ({
+      status,
+      headers: extraHeaders,
+      bodyText: JSON.stringify(obj)
+    });
+    if (!isClientAuthorized({ headers })) {
+      return respond(401, { error: "Unauthorized" }, {
+        "WWW-Authenticate": `Bearer resource_metadata="${getIssuer({ headers })}/.well-known/oauth-protected-resource/mcp"`
+      });
+    }
+    let msg;
+    try {
+      msg = JSON.parse(bodyText);
+    } catch (err) {
+      return respond(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } });
+    }
+    const { id = null, method, params } = msg || {};
+    if (method === "notifications/initialized" || (id === null && method?.startsWith("notifications/"))) {
+      return { status: 202, headers: {}, bodyText: "" };
+    }
+    try {
+      if (method === "initialize") {
+        recordLog("MCP 握手", "客户端已连接");
+        return respond(200, {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            protocolVersion: MCP_PROTOCOL_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: SERVER_INFO
+          }
+        });
+      }
+      if (method === "ping") {
+        return respond(200, { jsonrpc: "2.0", id, result: {} });
+      }
+      if (method === "tools/list") {
+        return respond(200, { jsonrpc: "2.0", id, result: { tools: TOOLS } });
+      }
+      if (method === "tools/call") {
+        const toolName = params?.name;
+        const toolArgs = params?.arguments || {};
+        recordLog("MCP 调用", `${toolName}${toolArgs.project ? ` (${toolArgs.project})` : ""}`);
+        try {
+          const data = await tree.routeToolCall(toolName, toolArgs);
+          return respond(200, {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+              structuredContent: data,
+              isError: data?.ok === false
+            }
+          });
+        } catch (toolErr) {
+          recordLog("调用失败", `${toolName}: ${toolErr.message}`);
+          return respond(200, {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: JSON.stringify({ ok: false, error: toolErr.message }) }],
+              isError: true
+            }
+          });
+        }
+      }
+      return respond(200, {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `Method not found: ${method}` }
+      });
+    } catch (err) {
+      return respond(500, {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32603, message: err.message }
+      });
+    }
+  }
+
   const server = http.createServer(async (req, res) => {
     let url;
     try {
@@ -379,7 +476,12 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
-    if (url.pathname === "/" || url.pathname === "/ui" || url.pathname.startsWith("/api/")) {
+    if (
+      url.pathname === "/" ||
+      url.pathname === "/ui" ||
+      url.pathname.startsWith("/api/") ||
+      url.pathname.startsWith("/remote/")
+    ) {
       if (!isDirectLocalhost(req)) {
         sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截外部隧道请求。" });
         return;
@@ -397,6 +499,32 @@ export function createBridgeServer(options = {}) {
       }
       if (req.headers["sec-fetch-site"] === "cross-site") {
         sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Sec-Fetch-Site: cross-site)。" });
+        return;
+      }
+
+      if (url.pathname.startsWith("/remote/")) {
+        if (req.method !== "POST") {
+          sendJson(req, res, 405, { error: "Method not allowed. Use POST /remote/<target>/mcp." });
+          return;
+        }
+        const targetMatch = /^\/remote\/([^/]+)\/mcp\/?$/.exec(url.pathname);
+        if (!targetMatch) {
+          sendJson(req, res, 404, { error: "Not found. Use POST /remote/<target>/mcp." });
+          return;
+        }
+        let remoteBody;
+        try {
+          remoteBody = await readBody(req);
+        } catch (err) {
+          sendJson(req, res, 400, { error: err.message });
+          return;
+        }
+        const fwdHeaders = {};
+        for (const h of ["authorization", "content-type", "accept", "mcp-protocol-version"]) {
+          if (req.headers[h] !== undefined) fwdHeaders[h] = req.headers[h];
+        }
+        const remoteRes = await remote.proxyRequest(decodeURIComponent(targetMatch[1]), fwdHeaders, remoteBody);
+        sendRaw(req, res, remoteRes.status, remoteRes.bodyText, remoteRes.headers);
         return;
       }
 
@@ -490,21 +618,6 @@ export function createBridgeServer(options = {}) {
           return;
         }
 
-        if (req.method === "POST" && /^\/api\/tree\/children\/[^/]+\/grant$/.test(url.pathname)) {
-          const nid = decodeURIComponent(
-            url.pathname.slice("/api/tree/children/".length, -"/grant".length)
-          );
-          const body = JSON.parse(await readBody(req));
-          const ok = tree.setChildGrant(nid, Boolean(body?.canCallTree));
-          if (!ok) {
-            sendJson(req, res, 404, { ok: false, error: `节点 "${nid}" 未绑定。` });
-            return;
-          }
-          recordLog("节点授权", `${nid} 允许调用整棵树 = ${Boolean(body?.canCallTree)}`);
-          sendJson(req, res, 200, { ok: true });
-          return;
-        }
-
         if (req.method === "DELETE" && url.pathname.startsWith("/api/tree/children/")) {
           const nid = decodeURIComponent(url.pathname.slice("/api/tree/children/".length));
           const removed = tree.removeChild(nid);
@@ -555,6 +668,12 @@ export function createBridgeServer(options = {}) {
           if (typeof body.directEnabled === "boolean") patch.directEnabled = body.directEnabled;
           if (typeof body.advertiseLan === "boolean") patch.advertiseLan = body.advertiseLan;
           if (typeof body.publicUrl === "string") patch.publicUrl = body.publicUrl.trim();
+          if (body.p2p && typeof body.p2p === "object") {
+            const p2p = { ...(loadSettings(bridgeRoot).p2p || {}) };
+            if (typeof body.p2p.enabled === "boolean") p2p.enabled = body.p2p.enabled;
+            if (typeof body.p2p.upnp === "boolean") p2p.upnp = body.p2p.upnp;
+            patch.p2p = p2p;
+          }
           if (Object.keys(patch).length) {
             saveSettings(bridgeRoot, patch);
             recordLog("设置更新", Object.keys(patch).join(", "));
@@ -603,6 +722,61 @@ export function createBridgeServer(options = {}) {
           return;
         }
 
+        if (req.method === "GET" && url.pathname === "/api/remote") {
+          sendJson(req, res, 200, remote.getStatus());
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/rendezvous") {
+          const body = JSON.parse(await readBody(req));
+          const current = loadSettings(bridgeRoot).rendezvous || {};
+          const rendezvous = {
+            enabled: Boolean(body.enabled),
+            url: typeof body.url === "string" ? body.url.trim() : current.url,
+            token: typeof body.token === "string" ? body.token.trim() : current.token
+          };
+          saveSettings(bridgeRoot, { rendezvous });
+          remote.reconnectRendezvous();
+          recordLog("牵线服务", rendezvous.enabled && rendezvous.url ? `已连接配置 ${rendezvous.url}` : "已停用");
+          sendJson(req, res, 200, { ok: true, hasToken: !!rendezvous.token, remote: remote.getStatus().rendezvous });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/remote/aliases") {
+          const body = JSON.parse(await readBody(req));
+          const alias = String(body.alias || "").trim();
+          if (!/^[a-zA-Z0-9_-]{1,48}$/.test(alias)) {
+            sendJson(req, res, 400, { ok: false, error: "别名只能包含字母、数字、短横线或下划线（1-48 字符）。" });
+            return;
+          }
+          const remotes = { ...(loadSettings(bridgeRoot).remotes || {}) };
+          if (body.address == null || body.address === "") {
+            delete remotes[alias];
+          } else {
+            const addr = String(body.address).trim();
+            if (!/^ag1-[a-z2-7]{32}$/.test(addr)) {
+              sendJson(req, res, 400, { ok: false, error: "节点地址格式应为 ag1- 开头的 32 位 base32。" });
+              return;
+            }
+            remotes[alias] = addr;
+          }
+          saveSettings(bridgeRoot, { remotes });
+          sendJson(req, res, 200, { ok: true, remotes });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/remote/allow") {
+          const body = JSON.parse(await readBody(req));
+          const list = Array.isArray(body.addresses) ? body.addresses.map(String) : null;
+          if (!list || list.some((a) => !/^ag1-[a-z2-7]{32}$/.test(a))) {
+            sendJson(req, res, 400, { ok: false, error: "地址列表每项都应为 ag1- 节点地址。" });
+            return;
+          }
+          saveSettings(bridgeRoot, { remoteAllowFrom: list });
+          sendJson(req, res, 200, { ok: true, remoteAllowFrom: list });
+          return;
+        }
+
         sendJson(req, res, 404, { ok: false, error: "Unknown admin API route." });
       } catch (err) {
         sendJson(req, res, 400, { ok: false, error: err.message });
@@ -627,92 +801,38 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
-    let msg;
+    let mcpBody;
     try {
-      const raw = await readBody(req);
-      msg = JSON.parse(raw);
+      mcpBody = await readBody(req);
     } catch (err) {
       sendJson(req, res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } });
       return;
     }
-
-    const { id = null, method, params } = msg || {};
-
-    if (method === "notifications/initialized" || (id === null && method?.startsWith("notifications/"))) {
-      res.writeHead(202);
-      res.end();
-      return;
-    }
-
-    try {
-      if (method === "initialize") {
-        recordLog("MCP 握手", "客户端已连接");
-        sendJson(req, res, 200, {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            protocolVersion: MCP_PROTOCOL_VERSION,
-            capabilities: { tools: {} },
-            serverInfo: SERVER_INFO
-          }
-        });
-        return;
-      }
-
-      if (method === "ping") {
-        sendJson(req, res, 200, { jsonrpc: "2.0", id, result: {} });
-        return;
-      }
-
-      if (method === "tools/list") {
-        sendJson(req, res, 200, { jsonrpc: "2.0", id, result: { tools: TOOLS } });
-        return;
-      }
-
-      if (method === "tools/call") {
-        const toolName = params?.name;
-        const toolArgs = params?.arguments || {};
-        recordLog("MCP 调用", `${toolName}${toolArgs.project ? ` (${toolArgs.project})` : ""}`);
-        try {
-          const data = await tree.routeToolCall(toolName, toolArgs);
-          sendJson(req, res, 200, {
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-              structuredContent: data,
-              isError: data?.ok === false
-            }
-          });
-        } catch (toolErr) {
-          recordLog("调用失败", `${toolName}: ${toolErr.message}`);
-          sendJson(req, res, 200, {
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [{ type: "text", text: JSON.stringify({ ok: false, error: toolErr.message }) }],
-              isError: true
-            }
-          });
-        }
-        return;
-      }
-
-      sendJson(req, res, 200, {
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32601, message: `Method not found: ${method}` }
-      });
-    } catch (err) {
-      sendJson(req, res, 500, {
-        jsonrpc: "2.0",
-        id,
-        error: { code: -32603, message: err.message }
-      });
-    }
+    const mcpRes = await handleMcp({ headers: req.headers, bodyText: mcpBody });
+    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, mcpRes.headers);
   });
 
   serverRef = server;
+
+  const remote = createRemoteManager({
+    identity: loadIdentity(bridgeRoot),
+    handleMcp,
+    onLog: recordLog,
+    getRendezvous: () => loadSettings(bridgeRoot).rendezvous,
+    getP2p: () => loadSettings(bridgeRoot).p2p,
+    getRemotes: () => loadSettings(bridgeRoot).remotes || {},
+    getRemoteAllowFrom: () => loadSettings(bridgeRoot).remoteAllowFrom || [],
+    getAuthMode: () => authMode,
+    p2pPort: options.p2pPort ?? null,
+    p2pCandidates: options.p2pCandidates ?? null,
+    upnp: options.upnp ?? true,
+    p2pDirectWindowMs: options.p2pDirectWindowMs ?? 2000,
+    channelIdleMs: options.channelIdleMs ?? 300_000,
+    channelPingMs: options.channelPingMs ?? null,
+    idleSweepMs: options.idleSweepMs ?? 60_000,
+    rendezvous: options.rendezvous ?? null
+  });
+  server.on("close", () => remote.shutdown());
 
   server.on("upgrade", (req, socket, head) => {
     let url;

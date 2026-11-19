@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
+import tls from "node:tls";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +13,10 @@ import { fileURLToPath } from "node:url";
 import { createBridgeServer } from "../src/server.mjs";
 import { PROTOCOL_VERSION } from "../src/tree.mjs";
 import { acceptWebSocketUpgrade, connectWebSocket } from "../src/ws.mjs";
+import { loadIdentity } from "../src/identity.mjs";
+import { openChannel } from "../src/secure-channel.mjs";
+import { createRendezvousServer } from "../src/rendezvous.mjs";
+import { createUpnpManager } from "../src/upnp.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -1104,176 +1110,7 @@ test("Astra Gemini protocol handshake: version mismatch closed 1008, no auto-rec
   }
 });
 
-test("Astra Gemini sibling routing: ../ via common parent requires canCallTree grant", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-sib-"));
-  const repoA = path.join(tmpBase, "repo-a");
-  const repoB = path.join(tmpBase, "repo-b");
-  initTempGitRepo(repoA);
-  initTempGitRepo(repoB);
-  const rootDir = makeTempBridgeRoot(tmpBase, "root");
-  const aDir = makeTempBridgeRoot(tmpBase, "a");
-  const bDir = makeTempBridgeRoot(tmpBase, "b");
-  fs.writeFileSync(path.join(rootDir, "projects.json"), "{}", "utf8");
-  fs.writeFileSync(path.join(aDir, "projects.json"), JSON.stringify({ demo: { root: repoA, mode: "direct", sdks: ["git"] } }), "utf8");
-  fs.writeFileSync(path.join(bDir, "projects.json"), JSON.stringify({ demo: { root: repoB, mode: "direct", sdks: ["git"] } }), "utf8");
-
-  const root = createBridgeServer({
-    bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "rt", joinToken: "rj", heartbeatIntervalMs: 200
-  });
-  await new Promise((r) => root.listen(0, "127.0.0.1", r));
-  const rootPort = root.address().port;
-  const rootUrl = `http://127.0.0.1:${rootPort}`;
-  const up = { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "rj" };
-
-  const nodeA = createBridgeServer({
-    bridgeRoot: aDir, nodeId: "anode", authMode: "bearer", authToken: "at", joinToken: "aj", heartbeatIntervalMs: 200, upstream: up
-  });
-  await new Promise((r) => nodeA.listen(0, "127.0.0.1", r));
-  const aUrl = `http://127.0.0.1:${nodeA.address().port}`;
-
-  const nodeB = createBridgeServer({
-    bridgeRoot: bDir, nodeId: "bnode", authMode: "bearer", authToken: "bt", joinToken: "bj", heartbeatIntervalMs: 200, upstream: up
-  });
-  await new Promise((r) => nodeB.listen(0, "127.0.0.1", r));
-  const bUrl = `http://127.0.0.1:${nodeB.address().port}`;
-
-  const online = (nid) => (root.tree.getTreeStatus().children || []).some((c) => c.nodeId === nid && c.online);
-
-  try {
-    assert.equal(await waitUntil(() => online("anode") && online("bnode")), true);
-
-    const denied = (await rpc(aUrl, "at", "tools/call", {
-      name: "pull_snapshot", arguments: { project: "../bnode/demo" }
-    })).body;
-    assert.equal(denied.result.isError, true);
-    assert.match(denied.result.content[0].text, /未被授权调用上级/);
-
-    const listDenied = (await rpc(aUrl, "at", "tools/call", { name: "list_projects", arguments: {} })).body.result.structuredContent;
-    assert.ok(!listDenied.some((p) => String(p.project).startsWith("../")));
-
-    const grant = await fetch(`${rootUrl}/api/tree/children/anode/grant`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ canCallTree: true })
-    }).then((r) => r.json());
-    assert.equal(grant.ok, true);
-
-    const listOk = (await rpc(aUrl, "at", "tools/call", { name: "list_projects", arguments: {} })).body.result.structuredContent;
-    assert.ok(listOk.some((p) => p.project === "../bnode/demo" && p.via === "upstream"));
-    assert.ok(!listOk.some((p) => String(p.project).startsWith("../anode")));
-
-    const snap = (await rpc(aUrl, "at", "tools/call", {
-      name: "pull_snapshot", arguments: { project: "../bnode/demo" }
-    })).body.result.structuredContent;
-    assert.ok(snap.files.some((f) => f.path === "app.js"));
-
-    const patch = "--- a/app.js\n+++ b/app.js\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n";
-    const patched = (await rpc(aUrl, "at", "tools/call", {
-      name: "apply_patch", arguments: { project: "../bnode/demo", patch }
-    })).body.result.structuredContent;
-    assert.equal(patched.ok, true, JSON.stringify(patched));
-    assert.equal(fs.readFileSync(path.join(repoB, "app.js"), "utf8"), "export const answer = 42;\n");
-
-    const ex = (await rpc(aUrl, "at", "tools/call", {
-      name: "exec_verify",
-      arguments: { project: "../bnode/demo", script: "const s = await sdk.git.status(); return s.ok && s.branch.length > 0;" }
-    })).body.result.structuredContent;
-    assert.equal(ex.ok, true, JSON.stringify(ex));
-    assert.equal(ex.result, true);
-
-    const deniedB = (await rpc(bUrl, "bt", "tools/call", {
-      name: "pull_snapshot", arguments: { project: "../anode/demo" }
-    })).body;
-    assert.equal(deniedB.result.isError, true);
-    assert.match(deniedB.result.content[0].text, /未被授权调用上级/);
-  } finally {
-    nodeA.close();
-    nodeB.close();
-    root.close();
-    fs.rmSync(tmpBase, { recursive: true, force: true });
-  }
-});
-
-test("Astra Gemini multi-level routing: ../../ hops and mid-level grant revocation", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-multi-"));
-  const repoB = path.join(tmpBase, "repo-b");
-  initTempGitRepo(repoB);
-  const rootDir = makeTempBridgeRoot(tmpBase, "root");
-  const midDir = makeTempBridgeRoot(tmpBase, "mid");
-  const sibDir = makeTempBridgeRoot(tmpBase, "sib");
-  const deepDir = makeTempBridgeRoot(tmpBase, "deep");
-  fs.writeFileSync(path.join(rootDir, "projects.json"), "{}", "utf8");
-  fs.writeFileSync(path.join(midDir, "projects.json"), "{}", "utf8");
-  fs.writeFileSync(path.join(deepDir, "projects.json"), "{}", "utf8");
-  fs.writeFileSync(path.join(sibDir, "projects.json"), JSON.stringify({ demo: { root: repoB, mode: "direct", sdks: ["git"] } }), "utf8");
-
-  const root = createBridgeServer({
-    bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "rt", joinToken: "rj", heartbeatIntervalMs: 200
-  });
-  await new Promise((r) => root.listen(0, "127.0.0.1", r));
-  const rootPort = root.address().port;
-  const rootUrl = `http://127.0.0.1:${rootPort}`;
-  const toRoot = { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "rj" };
-
-  const mid = createBridgeServer({
-    bridgeRoot: midDir, nodeId: "mid", authMode: "bearer", authToken: "mt", joinToken: "mj", heartbeatIntervalMs: 200, upstream: toRoot
-  });
-  await new Promise((r) => mid.listen(0, "127.0.0.1", r));
-  const midPort = mid.address().port;
-  const midUrl = `http://127.0.0.1:${midPort}`;
-
-  const sib = createBridgeServer({
-    bridgeRoot: sibDir, nodeId: "sib", authMode: "bearer", authToken: "st", joinToken: "sj", heartbeatIntervalMs: 200, upstream: toRoot
-  });
-  await new Promise((r) => sib.listen(0, "127.0.0.1", r));
-
-  const deep = createBridgeServer({
-    bridgeRoot: deepDir, nodeId: "deep", authMode: "bearer", authToken: "dt", joinToken: "dj", heartbeatIntervalMs: 200,
-    upstream: { enabled: true, url: `ws://127.0.0.1:${midPort}/ws/tree`, token: "mj" }
-  });
-  await new Promise((r) => deep.listen(0, "127.0.0.1", r));
-  const deepUrl = `http://127.0.0.1:${deep.address().port}`;
-
-  try {
-    assert.equal(await waitUntil(() =>
-      ["mid", "sib"].every((n) => (root.tree.getTreeStatus().children || []).some((c) => c.nodeId === n && c.online)) &&
-      (mid.tree.getTreeStatus().children || []).some((c) => c.nodeId === "deep" && c.online)
-    ), true);
-
-    const grantDeep = await fetch(`${midUrl}/api/tree/children/deep/grant`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ canCallTree: true })
-    }).then((r) => r.json());
-    assert.equal(grantDeep.ok, true);
-    const grantMid = await fetch(`${rootUrl}/api/tree/children/mid/grant`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ canCallTree: true })
-    }).then((r) => r.json());
-    assert.equal(grantMid.ok, true);
-
-    const snap = (await rpc(deepUrl, "dt", "tools/call", {
-      name: "pull_snapshot", arguments: { project: "../../sib/demo" }
-    })).body.result.structuredContent;
-    assert.ok(snap.files.some((f) => f.path === "app.js"), JSON.stringify(snap));
-
-    const revoke = await fetch(`${rootUrl}/api/tree/children/mid/grant`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ canCallTree: false })
-    }).then((r) => r.json());
-    assert.equal(revoke.ok, true);
-
-    const denied = (await rpc(deepUrl, "dt", "tools/call", {
-      name: "pull_snapshot", arguments: { project: "../../sib/demo" }
-    })).body;
-    assert.equal(denied.result.isError, true);
-    assert.match(denied.result.content[0].text, /未被授权调用上级/);
-  } finally {
-    deep.close();
-    sib.close();
-    mid.close();
-    root.close();
-    fs.rmSync(tmpBase, { recursive: true, force: true });
-  }
-});
-
-test("Astra Gemini invalid project ref: mid-path .. rejected", async () => {
+test("Astra Gemini revert: any .. ref rejected and grant API gone", async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-badref-"));
   const demoRepo = path.join(tmpBase, "demo-repo");
   initTempGitRepo(demoRepo);
@@ -1287,11 +1124,19 @@ test("Astra Gemini invalid project ref: mid-path .. rejected", async () => {
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
   try {
-    const res = (await rpc(baseUrl, "t", "tools/call", {
-      name: "pull_snapshot", arguments: { project: "a/../b" }
-    })).body;
-    assert.equal(res.result.isError, true);
-    assert.match(res.result.content[0].text, /只能作为开头/);
+    for (const ref of ["../x", "a/../b", "..", "../../x/y"]) {
+      const res = (await rpc(baseUrl, "t", "tools/call", {
+        name: "pull_snapshot", arguments: { project: ref }
+      })).body;
+      assert.equal(res.result.isError, true, ref);
+      assert.match(res.result.content[0].text, /非法的项目路径/);
+    }
+    const grant = await fetch(`${baseUrl}/api/tree/children/x/grant`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ canCallTree: true })
+    });
+    assert.equal(grant.status, 404);
   } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -1326,10 +1171,622 @@ test("Astra Gemini nodes.json migration: legacy string bindings upgraded on regi
     const online = () => (root.tree.getTreeStatus().children || []).some((c) => c.nodeId === "migkid" && c.online);
     assert.equal(await waitUntil(online), true);
     const bindings = JSON.parse(fs.readFileSync(path.join(rootDir, "nodes.json"), "utf8"));
-    assert.deepEqual(bindings.migkid, { secretHash, canCallTree: false });
+    assert.deepEqual(bindings.migkid, { secretHash });
   } finally {
     child.close();
     root.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+function listenOn(server) {
+  return new Promise((r) => server.listen(0, "127.0.0.1", r));
+}
+
+async function rpcRemote(baseUrl, target, token, method, params = {}) {
+  const res = await fetch(`${baseUrl}/remote/${encodeURIComponent(target)}/mcp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  });
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+async function remoteStatus(baseUrl) {
+  return fetch(`${baseUrl}/api/remote`).then((r) => r.json());
+}
+
+async function startRemoteNode(tmpBase, name, {
+  rvUrl, rvToken, authToken, joinToken, candidates, windowMs = 800, demoRoot = null,
+  authMode = "bearer", channelIdleMs, channelPingMs, idleSweepMs
+}) {
+  const dir = makeTempBridgeRoot(tmpBase, name);
+  const projects = demoRoot
+    ? { demo: { root: demoRoot, mode: "direct", sdks: ["git", "fs_read"] } }
+    : {};
+  fs.writeFileSync(path.join(dir, "projects.json"), JSON.stringify(projects, null, 2), "utf8");
+  const server = createBridgeServer({
+    bridgeRoot: dir,
+    nodeId: name,
+    authMode,
+    authToken,
+    joinToken,
+    rendezvous: { url: rvUrl, token: rvToken },
+    p2pPort: 0,
+    p2pCandidates: candidates,
+    p2pDirectWindowMs: windowMs,
+    channelIdleMs,
+    channelPingMs,
+    idleSweepMs,
+    upnp: false,
+    heartbeatIntervalMs: 200
+  });
+  await listenOn(server);
+  return { server, dir, baseUrl: `http://127.0.0.1:${server.address().port}` };
+}
+
+async function waitRvConnected(...baseUrls) {
+  for (const base of baseUrls) {
+    const ok = await waitUntil(async () => (await remoteStatus(base)).rendezvous?.connected === true, 8000);
+    assert.equal(ok, true, `rendezvous not connected on ${base}`);
+  }
+}
+
+test("remote identity: ag1- address, self-signed X509 verify, mutual TLS 1.3 channel", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-ident-"));
+  const dir = path.join(tmpBase, "bridge");
+  fs.mkdirSync(dir, { recursive: true });
+  const identity = loadIdentity(dir);
+  assert.match(identity.address, /^ag1-[a-z2-7]{32}$/);
+  assert.equal(loadIdentity(dir).address, identity.address);
+  assert.ok(fs.existsSync(path.join(dir, "identity.json")));
+
+  const x509 = new crypto.X509Certificate(identity.certPem);
+  assert.equal(x509.verify(identity.publicKey), true);
+  assert.equal(x509.subject.includes(`CN=${identity.address}`), true);
+
+  const server = net.createServer();
+  const serverChannels = [];
+  server.on("connection", (sock) => {
+    serverChannels.push(openChannel({ duplex: sock, role: "server", identity }));
+  });
+  await listenOn(server);
+  const port = server.address().port;
+
+  try {
+    const cli = await openChannel({
+      duplex: net.connect({ host: "127.0.0.1", port }),
+      role: "client",
+      identity,
+      expectedPeerAddress: identity.address
+    });
+    const srv = await serverChannels[0];
+    assert.equal(cli.peerAddress, identity.address);
+    assert.equal(srv.peerAddress, identity.address);
+    srv.onRequest(async ({ bodyText }) => ({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      bodyText: JSON.stringify({ ok: true, echo: bodyText })
+    }));
+    const res = await cli.request({ headers: { authorization: "Bearer x" }, body: '{"a":1}' });
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(res.body).echo, '{"a":1}');
+    cli.close();
+    srv.close();
+
+    await assert.rejects(
+      openChannel({
+        duplex: net.connect({ host: "127.0.0.1", port }),
+        role: "client",
+        identity,
+        expectedPeerAddress: `ag1-${"q".repeat(32)}`
+      }),
+      /不匹配/
+    );
+
+    const certless = new Promise((resolve, reject) => {
+      const raw = net.connect({ host: "127.0.0.1", port });
+      raw.on("connect", () => {
+        const s = tls.connect({
+          socket: raw,
+          minVersion: "TLSv1.3",
+          rejectUnauthorized: false,
+          ALPNProtocols: ["astra/1"],
+          checkServerIdentity: () => undefined
+        });
+        s.on("secureConnect", () => resolve(s));
+        s.on("error", reject);
+      });
+      raw.on("error", reject);
+    });
+    const tlsSock = await certless;
+    await assert.rejects(serverChannels[serverChannels.length - 1], /未提供证书/);
+    tlsSock.destroy();
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote rendezvous: token gate, hello signature, welcome address", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-rv-"));
+  const identity = loadIdentity(path.join(tmpBase, "node"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const base = `ws://127.0.0.1:${rv.server.address().port}`;
+
+  try {
+    await assert.rejects(
+      connectWebSocket(`${base}/rv`, { headers: { authorization: "Bearer wrong" } }),
+      /401|Unexpected|failed/i
+    );
+
+    const ws = await connectWebSocket(`${base}/rv`, { headers: { authorization: "Bearer rvt" } });
+    const welcome = await new Promise((resolve, reject) => {
+      ws.on("message", (text) => {
+        const msg = JSON.parse(text);
+        if (msg.t === "challenge") {
+          const sig = crypto.sign(null, Buffer.from(`astra-rv-v1:${msg.nonce}`), identity.privateKey);
+          ws.sendJson({
+            t: "hello",
+            protocolVersion: PROTOCOL_VERSION,
+            spki: identity.spkiDer.toString("base64"),
+            sig: sig.toString("base64")
+          });
+        } else if (msg.t === "welcome") {
+          resolve(msg);
+        }
+      });
+      ws.on("close", (code, reason) => reject(new Error(`closed ${code} ${reason}`)));
+    });
+    assert.equal(welcome.address, identity.address);
+    assert.equal(typeof welcome.observedIp, "string");
+    ws.close(1000, "bye");
+
+    const badSig = await connectWebSocket(`${base}/rv`, { headers: { authorization: "Bearer rvt" } });
+    const closeInfo = await new Promise((resolve) => {
+      badSig.on("message", (text) => {
+        const msg = JSON.parse(text);
+        if (msg.t === "challenge") {
+          badSig.sendJson({
+            t: "hello",
+            protocolVersion: PROTOCOL_VERSION,
+            spki: identity.spkiDer.toString("base64"),
+            sig: crypto.randomBytes(64).toString("base64")
+          });
+        }
+      });
+      badSig.on("close", (code, reason) => resolve({ code, reason }));
+    });
+    assert.equal(closeInfo.code, 1008);
+  } finally {
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote direct: A proxies /remote/<addr>/mcp to B over P2P mutual TLS", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-direct-"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
+  const rvHttp = `http://127.0.0.1:${rv.server.address().port}`;
+
+  const bRepo = path.join(tmpBase, "b-repo");
+  initTempGitRepo(bRepo);
+  let aCands = [];
+  let bCands = [];
+  const A = await startRemoteNode(tmpBase, "nodeA", {
+    rvUrl, rvToken: "rvt", authToken: "tA", joinToken: "jA", candidates: () => aCands
+  });
+  const B = await startRemoteNode(tmpBase, "nodeB", {
+    rvUrl, rvToken: "rvt", authToken: "tB", joinToken: "jB", candidates: () => bCands, demoRoot: bRepo
+  });
+
+  try {
+    const statA = await remoteStatus(A.baseUrl);
+    const statB = await remoteStatus(B.baseUrl);
+    aCands = [`127.0.0.1:${statA.p2p.port}`];
+    bCands = [`127.0.0.1:${statB.p2p.port}`];
+    await waitRvConnected(A.baseUrl, B.baseUrl);
+
+    const list = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
+    assert.equal(list.status, 200);
+    const names = (list.body.result.tools || []).map((t) => t.name);
+    assert.ok(names.includes("pull_snapshot"));
+
+    const snap = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/call", {
+      name: "pull_snapshot",
+      arguments: { project: "demo" }
+    });
+    assert.equal(snap.status, 200);
+    assert.notEqual(snap.body.result.isError, true);
+    assert.match(JSON.stringify(snap.body.result), /app\.js/);
+
+    const statA2 = await remoteStatus(A.baseUrl);
+    assert.equal(statA2.channels.length >= 1, true);
+    assert.equal(statA2.channels[0].mode, "direct");
+    assert.equal(statA2.channels[0].peer, statB.address);
+
+    const health = await fetch(`${rvHttp}/health`).then((r) => r.json());
+    assert.equal(health.relayedBytes, 0);
+
+    const [p1, p2] = await Promise.all([
+      rpcRemote(A.baseUrl, statB.address, "tB", "tools/list"),
+      rpcRemote(A.baseUrl, statB.address, "tB", "tools/list")
+    ]);
+    assert.equal(p1.status, 200);
+    assert.equal(p2.status, 200);
+    const statA3 = await remoteStatus(A.baseUrl);
+    assert.equal(statA3.channels.filter((c) => c.direction === "out" && c.peer === statB.address).length, 1);
+
+    const reverse = await rpcRemote(B.baseUrl, statA.address, "tA", "tools/list");
+    assert.equal(reverse.status, 200);
+    const statB2 = await remoteStatus(B.baseUrl);
+    assert.equal(
+      statB2.channels.filter((c) => c.direction === "out" && c.peer === statA.address).length,
+      1
+    );
+
+    const bad = await rpcRemote(A.baseUrl, statB.address, "wrong-token", "tools/list");
+    assert.equal(bad.status, 401);
+  } finally {
+    A.server.close();
+    B.server.close();
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote relay fallback: ciphertext-only bytes over rendezvous when direct fails", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-relay-"));
+  const captured = [];
+  const rv = createRendezvousServer({ token: "rvt", onRelayChunk: (buf) => captured.push(Buffer.from(buf)) });
+  await listenOn(rv.server);
+  const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
+  const rvHttp = `http://127.0.0.1:${rv.server.address().port}`;
+
+  const bRepo = path.join(tmpBase, "b-repo");
+  initTempGitRepo(bRepo);
+  const dead = ["127.0.0.1:9"];
+  const A = await startRemoteNode(tmpBase, "nodeA", {
+    rvUrl, rvToken: "rvt", authToken: "tA", joinToken: "jA", candidates: () => dead, windowMs: 600
+  });
+  const B = await startRemoteNode(tmpBase, "nodeB", {
+    rvUrl, rvToken: "rvt", authToken: "tB", joinToken: "jB", candidates: () => dead, windowMs: 600, demoRoot: bRepo
+  });
+
+  try {
+    const statB = await remoteStatus(B.baseUrl);
+    await waitRvConnected(A.baseUrl, B.baseUrl);
+
+    const list = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
+    assert.equal(list.status, 200);
+
+    const statA2 = await remoteStatus(A.baseUrl);
+    assert.equal(statA2.channels.length >= 1, true);
+    assert.equal(statA2.channels[0].mode, "relay");
+
+    const ok = await waitUntil(async () => {
+      const h = await fetch(`${rvHttp}/health`).then((r) => r.json());
+      return h.relayedBytes > 0;
+    }, 4000);
+    assert.equal(ok, true);
+
+    const blob = Buffer.concat(captured).toString("latin1");
+    assert.equal(blob.includes("tB"), false);
+    assert.equal(blob.includes("tools/list"), false);
+  } finally {
+    A.server.close();
+    B.server.close();
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote aliases, unknown target 404, offline target 502", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-alias-"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
+
+  const A = await startRemoteNode(tmpBase, "nodeA", {
+    rvUrl, rvToken: "rvt", authToken: "tA", joinToken: "jA", candidates: () => []
+  });
+  const B = await startRemoteNode(tmpBase, "nodeB", {
+    rvUrl, rvToken: "rvt", authToken: "tB", joinToken: "jB", candidates: () => []
+  });
+
+  try {
+    const statB = await remoteStatus(B.baseUrl);
+    await waitRvConnected(A.baseUrl, B.baseUrl);
+
+    const add = await fetch(`${A.baseUrl}/api/remote/aliases`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alias: "bb", address: statB.address })
+    }).then((r) => r.json());
+    assert.equal(add.ok, true);
+    assert.equal(add.remotes.bb, statB.address);
+
+    const list = await rpcRemote(A.baseUrl, "bb", "tB", "tools/list");
+    assert.equal(list.status, 200);
+
+    const unknown = await rpcRemote(A.baseUrl, "nosuch", "tB", "tools/list");
+    assert.equal(unknown.status, 404);
+
+    const offline = await rpcRemote(A.baseUrl, `ag1-${"a".repeat(32)}`, "tB", "tools/list");
+    assert.equal(offline.status, 502);
+    assert.match(offline.body.error, /不在线/);
+  } finally {
+    A.server.close();
+    B.server.close();
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote remoteAllowFrom: B rejects A not on allowlist", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-allow-"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
+
+  const A = await startRemoteNode(tmpBase, "nodeA", {
+    rvUrl, rvToken: "rvt", authToken: "tA", joinToken: "jA", candidates: () => []
+  });
+  const B = await startRemoteNode(tmpBase, "nodeB", {
+    rvUrl, rvToken: "rvt", authToken: "tB", joinToken: "jB", candidates: () => []
+  });
+
+  try {
+    const statB = await remoteStatus(B.baseUrl);
+    await waitRvConnected(A.baseUrl, B.baseUrl);
+
+    const allow = await fetch(`${B.baseUrl}/api/remote/allow`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ addresses: [`ag1-${"z".repeat(32)}`] })
+    }).then((r) => r.json());
+    assert.equal(allow.ok, true);
+
+    const res = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
+    assert.equal(res.status, 502);
+    assert.match(res.body.error, /允许列表/);
+  } finally {
+    A.server.close();
+    B.server.close();
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote p2p preamble: garbage and unknown sid closed before TLS", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-pre-"));
+  const B = await startRemoteNode(tmpBase, "nodeB", {
+    rvUrl: "", rvToken: "", authToken: "tB", joinToken: "jB", candidates: () => []
+  });
+  try {
+    const statB = await remoteStatus(B.baseUrl);
+    const p2pPort = statB.p2p.port;
+    assert.ok(p2pPort > 0);
+
+    for (const payload of ["GARBAGE NOT A PREAMBLE\n", "ASTRA-P2P/1 deadbeefdeadbeef\n"]) {
+      const closed = await new Promise((resolve) => {
+        const sock = net.connect({ host: "127.0.0.1", port: p2pPort });
+        const timer = setTimeout(() => {
+          sock.destroy();
+          resolve(false);
+        }, 2500);
+        sock.on("connect", () => sock.write(payload));
+        sock.on("close", () => {
+          clearTimeout(timer);
+          resolve(true);
+        });
+        sock.on("error", () => {});
+      });
+      assert.equal(closed, true, `socket not closed for ${JSON.stringify(payload)}`);
+    }
+  } finally {
+    B.server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("upnp: fake IGD controlURL parsing, AddPortMapping fields, DeletePortMapping on stop", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-upnp-"));
+  const soapCalls = [];
+  const igd = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/desc.xml") {
+      const port = igd.address().port;
+      res.writeHead(200, { "content-type": "text/xml" }).end(
+        `<?xml version="1.0"?><root><URLBase>http://127.0.0.1:${port}/</URLBase>` +
+          `<device><serviceList><service>` +
+          `<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>` +
+          `<controlURL>/ctl</controlURL>` +
+          `</service></serviceList></device></root>`
+      );
+      return;
+    }
+    if (req.method === "POST" && req.url === "/ctl") {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        const action = /#(\w+)"/.exec(req.headers.soapaction || "")?.[1] || "";
+        soapCalls.push({ action, text });
+        let body = '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>';
+        if (action === "GetExternalIPAddress") {
+          body += '<u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1"><NewExternalIPAddress>203.0.113.7</NewExternalIPAddress></u:GetExternalIPAddressResponse>';
+        } else {
+          body += `<u:${action}Response xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1"/>`;
+        }
+        body += "</s:Body></s:Envelope>";
+        res.writeHead(200, { "content-type": "text/xml" }).end(body);
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await listenOn(igd);
+
+  try {
+    const mgr = createUpnpManager({
+      port: 3940,
+      internalIp: "192.168.1.50",
+      location: `http://127.0.0.1:${igd.address().port}/desc.xml`
+    });
+    const st = await mgr.start();
+    assert.equal(st.state, "mapped");
+    assert.equal(st.externalAddr, "203.0.113.7:3940");
+
+    const add = soapCalls.find((c) => c.action === "AddPortMapping");
+    assert.ok(add);
+    assert.match(add.text, /<NewExternalPort>3940<\/NewExternalPort>/);
+    assert.match(add.text, /<NewInternalPort>3940<\/NewInternalPort>/);
+    assert.match(add.text, /<NewProtocol>TCP<\/NewProtocol>/);
+    assert.match(add.text, /<NewInternalClient>192\.168\.1\.50<\/NewInternalClient>/);
+    assert.match(add.text, /astra-gemini/);
+    assert.match(add.text, /<NewLeaseDuration>3600<\/NewLeaseDuration>/);
+
+    await mgr.stop();
+    assert.equal(soapCalls.some((c) => c.action === "DeletePortMapping"), true);
+  } finally {
+    igd.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote auth guard: authMode none node rejects remote channel requests with 403", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-noauth-"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
+  const A = await startRemoteNode(tmpBase, "nodeA", {
+    rvUrl, rvToken: "rvt", authToken: "tA", joinToken: "jA", candidates: () => []
+  });
+  const B = await startRemoteNode(tmpBase, "nodeB", {
+    rvUrl, rvToken: "rvt", joinToken: "jB", candidates: () => [], authMode: "none"
+  });
+  try {
+    const statB = await remoteStatus(B.baseUrl);
+    await waitRvConnected(A.baseUrl, B.baseUrl);
+    for (const token of [null, "anything"]) {
+      const res = await rpcRemote(A.baseUrl, statB.address, token, "tools/list");
+      assert.equal(res.status, 403);
+      assert.match(res.body.error, /未启用鉴权/);
+    }
+  } finally {
+    A.server.close();
+    B.server.close();
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("remote idle: channel closes after channelIdleMs despite ping/pong traffic", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-idle-"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
+  const opts = {
+    rvUrl, rvToken: "rvt", candidates: () => [],
+    channelPingMs: 50, channelIdleMs: 400, idleSweepMs: 150
+  };
+  const A = await startRemoteNode(tmpBase, "nodeA", { ...opts, authToken: "tA", joinToken: "jA" });
+  const B = await startRemoteNode(tmpBase, "nodeB", { ...opts, authToken: "tB", joinToken: "jB" });
+  try {
+    const statB = await remoteStatus(B.baseUrl);
+    await waitRvConnected(A.baseUrl, B.baseUrl);
+    const res = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
+    assert.equal(res.status, 200);
+    assert.equal((await remoteStatus(A.baseUrl)).channels.length >= 1, true);
+    const closed = await waitUntil(async () => (await remoteStatus(A.baseUrl)).channels.length === 0, 5000);
+    assert.equal(closed, true, "idle channel was not closed");
+  } finally {
+    A.server.close();
+    B.server.close();
+    rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("rendezvous relay: duplicate role join and wrong key rejected with 403", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-dupleg-"));
+  const idA = loadIdentity(path.join(tmpBase, "na"));
+  const idB = loadIdentity(path.join(tmpBase, "nb"));
+  const rv = createRendezvousServer({ token: "rvt" });
+  await listenOn(rv.server);
+  const base = `ws://127.0.0.1:${rv.server.address().port}`;
+
+  const mkNode = async (id) => {
+    const ws = await connectWebSocket(`${base}/rv`, { headers: { authorization: "Bearer rvt" } });
+    const queue = [];
+    const waiters = [];
+    ws.on("message", (t) => {
+      const m = JSON.parse(t);
+      if (m.t === "challenge") {
+        const sig = crypto.sign(null, Buffer.from(`astra-rv-v1:${m.nonce}`), id.privateKey);
+        ws.sendJson({
+          t: "hello",
+          protocolVersion: PROTOCOL_VERSION,
+          spki: id.spkiDer.toString("base64"),
+          sig: sig.toString("base64")
+        });
+        return;
+      }
+      for (let i = 0; i < waiters.length; i++) {
+        if (waiters[i](m)) {
+          waiters.splice(i, 1);
+          return;
+        }
+      }
+      queue.push(m);
+    });
+    const next = (pred) =>
+      new Promise((resolve) => {
+        const i = queue.findIndex(pred);
+        if (i >= 0) return resolve(queue.splice(i, 1)[0]);
+        waiters.push((m) => {
+          if (!pred(m)) return false;
+          resolve(m);
+          return true;
+        });
+      });
+    await next((m) => m.t === "welcome");
+    return { ws, next };
+  };
+
+  try {
+    const nodeA = await mkNode(idA);
+    const nodeB = await mkNode(idB);
+    nodeA.ws.sendJson({ t: "connect", id: "c1", to: idB.address, candidates: [] });
+    const incoming = await nodeB.next((m) => m.t === "incoming");
+    nodeB.ws.sendJson({ t: "accept", sid: incoming.sid, candidates: [] });
+    const connOk = await nodeA.next((m) => m.t === "connect-ok");
+
+    const leg1 = await connectWebSocket(
+      `${base}/rv/relay?sid=${connOk.sid}&role=a&key=${connOk.relayKey}`,
+      { headers: { authorization: "Bearer rvt" } }
+    );
+    assert.ok(leg1);
+    await assert.rejects(
+      connectWebSocket(`${base}/rv/relay?sid=${connOk.sid}&role=a&key=${connOk.relayKey}`, {
+        headers: { authorization: "Bearer rvt" }
+      }),
+      /403/
+    );
+    await assert.rejects(
+      connectWebSocket(`${base}/rv/relay?sid=${connOk.sid}&role=b&key=badkey`, {
+        headers: { authorization: "Bearer rvt" }
+      }),
+      /403/
+    );
+    leg1.close(1000, "done");
+    nodeA.ws.close(1000, "done");
+    nodeB.ws.close(1000, "done");
+  } finally {
+    rv.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });

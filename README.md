@@ -27,7 +27,7 @@
 
 - `POST /mcp`：JSON-RPC 2.0，单请求单响应（无 SSE）。认证为 `Authorization: Bearer <客户端 Token>` 或 OAuth access token；未带凭据返回 401 并附 `WWW-Authenticate: Bearer resource_metadata=…`。
 - `WS /ws/tree`：子节点入网（仅入网 Token）。`WS /ws/direct`：节点间点对点直连（15 秒一次性票据）。`GET /health`：存活探测。
-- 项目寻址支持多级路径：本机项目写 `my-app`，子树项目写 `<节点Id>/<项目>`（更深层 `<a>/<b>/<项目>`），平级兄弟项目写 `../<兄弟节点>/<项目>`（需上级授权，见「兄弟节点互访」）。
+- 项目寻址支持多级路径：本机项目写 `my-app`，子树项目写 `<节点Id>/<项目>`，更深层写 `<a>/<b>/<项目>`。
 
 | 工具 | 作用 | 关键参数 | 关键返回 |
 | --- | --- | --- | --- |
@@ -90,12 +90,15 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
 - **两类凭据权限边界**：客户端 Token → `/mcp` 全部工具 + OAuth 登录口令；入网 Token → 仅 `/ws/tree` 注册。两者互不相通（交叉使用均 401），比较均使用恒定时算法。
 - **重要**：拿到客户端 Token（或完成 OAuth 授权）的调用方，对每个 `mode: "direct"` 项目约等于拥有本机用户的代码执行能力——可先 `apply_patch` 修改 `package.json`，再 `exec_verify` 调 `sdk.npm.run` 执行。只给受信任的 AI/节点授权。
 - `readonly` 仅阻止 `apply_patch` 写盘，**不阻止 `exec_verify`**（其后果取决于启用的 SDK，如 `npm run build` 仍会写产物）。需要严格只读时，请同时把项目 `sdks` 收缩为 `["fs_read"]` 等纯读集合。
-- 上级节点的 `/mcp` 凭据持有者可对整棵子树（含全部后代节点的项目）发起工具调用；入网 Token 只决定谁能挂载上来，不约束上级的调用能力。兄弟节点默认互不可见：`../` 平级访问必须经上级按 `canCallTree` 授权逐跳放行（`authMode=none` 不豁免此项），被授权节点由此获得与上级同级的调用面。
+- 上级节点的 `/mcp` 凭据持有者可对整棵子树（含全部后代节点的项目）发起工具调用；入网 Token 只决定谁能挂载上来，不约束上级的调用能力。
 - `exec_verify` 沙箱边界：独立 `node --permission` 子进程，仅 `--allow-fs-read` 自身文件；SDK 调用经宿主端白名单校验的 IPC 代理，返回值 JSON 序列化。已知残余风险：`process.kill`/`process.abort` 不受权限模型管控（脚本可终止自身或信号同用户进程）；CPU/内存仅靠超时兜底（默认 30s、上限 120s）。
 - 管理控制台（`/ui`、`/api/*`）只接受本机 socket，且校验 Host（仅 `127.0.0.1`/`localhost`/`::1`）、Origin 必须同源、拒绝 `Sec-Fetch-Site: cross-site`（防 DNS rebinding 与跨站提交）。经公网入口到达的管理请求一律 403。
 - OAuth 防护：强制 PKCE S256；授权码 60 秒一次性；refresh token 轮换（旧值立即失效）；access token 1 小时、refresh token 30 天；授权口令 10 分钟内失败超 10 次锁定 10 分钟；`/oauth/register` 限流（默认每小时 20 次、客户端上限 200，超限时优先驱逐无活跃令牌的客户端）。
 - 节点 TOFU 绑定：子节点首次注册将 `nodeId → sha256(nodeSecret)` 落盘 `nodes.json`；此后同名不同密的连接被 `1008` 拒绝且不顶替现有连接，控制台「星图组网」可一键移除重置。
 - 直连票据 15 秒一次性单用；心跳每 25 秒一次、超过 75 秒无应答断开并自动重连（退避重试，成功即重置）。
+- **远程直达信任边界**：P2P 监听端口（默认 3940）的入站 socket 必须在 5 秒内发送带已知会话 ID 的 `ASTRA-P2P/1 <sid>` 前导行，未知 sid 立即断开，对扫描器不暴露 TLS；随后建立 TLS 1.3 双向认证并把对端证书 SPKI 锁定到 `ag1-` 节点地址（`identity.json` 中的 Ed25519 密钥决定地址）。
+- **牵线服务**无法冒充任一节点（hello 帧用节点私钥对 challenge 签名）也读不到通道明文，但能看到元数据：谁连谁、双方 IP、转发字节数。`remoteAllowFrom` 非空时可再收一层呼入白名单。
+- **UPnP** 默认开启，会在路由器上映射 P2P 端口（TCP，租约 3600 秒，退出时自动删除映射）；不需要时在设置里关闭。
 
 ## 上公网
 
@@ -133,13 +136,26 @@ MCP 地址填 `<公网地址>/mcp`，认证方式选 **OAuth**：跳出的中文
 
 子节点控制台「上游父节点」填 `wss://<公网地址>/ws/tree` + 入网 Token（`join-token.txt`），保存即自动连入并出现在父节点「星图组网」页签。协议版本不匹配、`nodeSecret` 不匹配等策略性关闭（`1008`）不会自动重连，修正后需重新保存上游；被父节点「移除/重置」（`1000`）则会自动重连并以全新绑定重新注册。
 
-### 兄弟节点互访（`../` 寻址）
+## 远程直达（A 上的 Claude Code 访问 B）
 
-子节点可以经共同上级中转访问平级节点或上级自身的项目：项目路径以 `../` 开头即「交给上级解析」，例如 `../<兄弟节点>/<项目>`、`../<上级本地项目>`，多级向上写 `../../<…>`。`..` 只允许出现在路径开头，`a/../b` 会被拒绝。
+A、B 是两台各自运行 astra-gemini 的机器。A 本机的 AI 客户端连 `http://127.0.0.1:<A端口>/remote/<B别名或地址>/mcp`，请求经端到端加密通道（TLS 1.3 mutual + 节点证书固定）直达 B 的 `/mcp` 入口，**授权只看 B 入口自己的凭据**（B 的客户端 Token 或 OAuth）——牵线服务只撮合连接与转发密文，没有任何调用权限。
 
-这需要上级在「星图组网」页签为该子节点打开「允许调用整棵树」开关（`canCallTree`，持久化在 `nodes.json`，**默认关闭**）：被授权节点经上级中转后可调用的范围等同于上级客户端本身（整棵树），授权面很大，只应对可信节点开启。未授权时 `../` 调用返回未授权错误，`list_projects` 也不会列出 `../` 条目；上级回答 `list_projects` 时会自动剔除调用方自己的子树条目，避免重复。
+1. **部署牵线服务**（任选一台有公网地址的机器，含 A/B 之外的 VPS）：
 
-示例：节点 A 上的 Claude Code 连本机 `/mcp`，对 `../B/my-app` 调用 `pull_snapshot` / `apply_patch` —— 请求经上级 R 中继到兄弟节点 B 执行（R 到 B 之间仍可能自动升级为直连隧道）。
+   ```bash
+   RV_TOKEN=<随机长令牌> HOST=127.0.0.1 PORT=3941 npm run rendezvous
+   ```
+
+   生产环境用 `deploy/astra-rendezvous.service`（环境文件 `/etc/astra-rendezvous.env` 写入 `RV_TOKEN`、`HOST=127.0.0.1`、`PORT=3941`）加 Caddy 反代一个独立域名（`deploy/Caddyfile` 有示例）。`GET /health` 返回 `{ ok, nodes, sessions, relayedBytes }`——中继只统计转发字节数，不解析内容。
+2. **两端都配置牵线服务**：控制台「远程直达」卡片填入同一服务地址（`wss://rv.example.com`）与 RV_TOKEN。节点上线时用 `identity.json` 的 Ed25519 私钥对服务下发的 challenge 签名，服务由此推导出 `ag1-` 节点地址。
+3. **A 上给 B 起别名**：在「远端别名」填入 B 的节点地址（B 控制台「本机节点地址」一键复制 `ag1-…`）。
+4. **A 上给 AI 配接入**（以别名 `home-b` 为例，控制台可直接复制该行）：
+
+   ```bash
+   claude mcp add --transport http home-b http://127.0.0.1:3939/remote/home-b/mcp --header "Authorization: Bearer <B 的客户端 Token>"
+   ```
+5. **通道建立**：发起后双方并发拨对方的候选地址——P2P 监听的非回环 IPv4、非 link-local IPv6（含 ULA）、UPnP 映射的公网地址——约 2 秒直连窗口内最先完成 mutual TLS 的 socket 胜出（`mode: "direct"`）；否则经牵线服务建 WebSocket 管道，在同一密管上再跑同一套 TLS（`mode: "relay"`）。B 端 `remoteAllowFrom` 非空时，不在名单内的发起地址会被拒绝。
+6. **暂未实现 UDP hole punching**：双方都在 NAT 后且无 IPv6/UPnP 时只能走中继。`/remote/...` 入口与管理控制台同样只接受本机 socket。
 
 ## 本地状态文件
 
@@ -152,6 +168,7 @@ MCP 地址填 `<公网地址>/mcp`，认证方式选 **OAuth**：跳出的中文
 | `token.txt` / `join-token.txt` | 客户端 Token / 入网 Token |
 | `nodes.json` | 子节点 TOFU 绑定（`nodeId → sha256(nodeSecret)`） |
 | `oauth-state.json` | OAuth 客户端与令牌哈希（不存明文令牌） |
+| `identity.json` | Ed25519 节点密钥对（`ag1-` 地址的来源；私钥泄露=节点身份被冒充） |
 | `.bridge-backup/` | `apply_patch` 自动备份，供回滚 |
 | `.bridge-worktrees/` | `worktree` SDK 创建的隔离工作树 |
 

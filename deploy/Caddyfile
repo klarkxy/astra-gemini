@@ -1,3 +1,9 @@
 astra.example.com {
 	reverse_proxy 127.0.0.1:3939
 }
+
+# 牵线服务（rendezvous）：单独域名指向 astra-rendezvous.service 的 3941 端口。
+# 环境文件 /etc/astra-rendezvous.env 需包含：RV_TOKEN=<随机长令牌> HOST=127.0.0.1 PORT=3941
+# rv.example.com {
+#	reverse_proxy 127.0.0.1:3941
+# }

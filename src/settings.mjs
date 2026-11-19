@@ -25,6 +25,18 @@ export const DEFAULT_SETTINGS = {
     token: "",
     publicUrl: ""
   },
+  rendezvous: {
+    enabled: false,
+    url: "",
+    token: ""
+  },
+  p2p: {
+    enabled: true,
+    port: 3940,
+    upnp: true
+  },
+  remotes: {},
+  remoteAllowFrom: [],
   globalSdkEnabled: {
     git: true,
     pnpm: true,
@@ -45,6 +57,10 @@ function mergedDefaults() {
     ...DEFAULT_SETTINGS,
     upstream: { ...DEFAULT_SETTINGS.upstream },
     tunnel: { ...DEFAULT_SETTINGS.tunnel },
+    rendezvous: { ...DEFAULT_SETTINGS.rendezvous },
+    p2p: { ...DEFAULT_SETTINGS.p2p },
+    remotes: { ...DEFAULT_SETTINGS.remotes },
+    remoteAllowFrom: [...DEFAULT_SETTINGS.remoteAllowFrom],
     globalSdkEnabled: { ...DEFAULT_SETTINGS.globalSdkEnabled }
   };
 }
@@ -60,6 +76,8 @@ export function loadSettings(bridgeRoot) {
         ...raw,
         upstream: { ...DEFAULT_SETTINGS.upstream, ...(raw.upstream || {}) },
         tunnel: { ...DEFAULT_SETTINGS.tunnel, ...(raw.tunnel || {}) },
+        rendezvous: { ...DEFAULT_SETTINGS.rendezvous, ...(raw.rendezvous || {}) },
+        p2p: { ...DEFAULT_SETTINGS.p2p, ...(raw.p2p || {}) },
         globalSdkEnabled: {
           ...DEFAULT_SETTINGS.globalSdkEnabled,
           ...(raw.globalSdkEnabled || {})

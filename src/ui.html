@@ -284,6 +284,66 @@
 
       <div class="sub" id="directStatsText" style="margin-bottom:10px;"></div>
       <div id="childNodeList"></div>
+
+      <div class="card" style="margin-top:16px;margin-bottom:16px;">
+        <div class="card-head" style="margin-bottom:10px;">
+          <div>
+            <strong>远程直达（A 设备上的 AI 通过本机入口访问远端节点 B）</strong>
+            <div class="sub">端到端加密：Ed25519 节点证书 + TLS 1.3 双向认证。牵线服务只撮合与转发密文，没有任何调用权限。</div>
+          </div>
+          <span class="tag" id="remoteBadge">未配置</span>
+        </div>
+        <div class="kv-row" style="margin-bottom:10px;">
+          <div class="kv-label" style="align-self:center;white-space:nowrap;">本机节点地址</div>
+          <code class="box" id="remoteAddress">…</code>
+          <button class="sm" onclick="copyText(state.remote?.address || '', '已复制节点地址')">复制</button>
+        </div>
+        <div class="form-grid">
+          <label class="field">牵线服务地址（可选，跨网互联需要）
+            <input type="text" id="rRvUrl" placeholder="wss://rv.example.com" />
+          </label>
+          <label class="field">牵线服务 Token（RV_TOKEN，留空则保持不变）
+            <input type="password" id="rRvToken" placeholder="部署牵线服务时设置的令牌" />
+          </label>
+        </div>
+        <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-top:4px;">
+          <button class="primary" onclick="saveRendezvous(true)">保存并连接牵线服务</button>
+          <button class="danger" onclick="saveRendezvous(false)">停用牵线服务</button>
+          <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+            <span class="switch"><input type="checkbox" id="swP2p" /><span class="slider"></span></span>
+            P2P 直连监听（重启后生效）
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+            <span class="switch"><input type="checkbox" id="swUpnp" /><span class="slider"></span></span>
+            UPnP 路由器端口映射（重启后生效）
+          </label>
+        </div>
+        <div class="sub" id="remoteDetail" style="margin-top:8px;"></div>
+        <div class="sub" id="p2pStatus" style="margin-top:4px;"></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head"><strong>远端别名（本机作为 A，访问远端 B）</strong></div>
+        <div id="aliasList"></div>
+        <div class="form-grid" style="margin-top:10px;">
+          <label class="field">别名
+            <input type="text" id="rAlias" placeholder="例如 home-b" />
+          </label>
+          <label class="field">远端节点地址（ag1- 开头，向 B 索取）
+            <input type="text" id="rAliasAddr" placeholder="ag1-…" />
+          </label>
+        </div>
+        <button class="sm primary" style="margin-top:10px;" onclick="addAlias()">添加别名</button>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head"><strong>呼入白名单与活跃通道（本机作为 B）</strong></div>
+        <label class="field">remoteAllowFrom：允许的呼入节点地址（逗号分隔，留空 = 接受任意节点）
+          <input type="text" id="rAllow" placeholder="留空表示不限制呼入来源" />
+        </label>
+        <button class="sm primary" style="margin-top:10px;margin-bottom:12px;" onclick="saveAllow()">保存白名单</button>
+        <div id="channelList"></div>
+      </div>
     </section>
 
     <section id="panel-backups" class="panel">
@@ -501,7 +561,7 @@
       }
       list.innerHTML = `
         <table>
-          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th><th>授权</th><th>操作</th></tr></thead>
+          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th><th>操作</th></tr></thead>
           <tbody>
             ${children.map((c) => `
               <tr>
@@ -509,7 +569,6 @@
                 <td><span class="tag ${c.online ? "ok" : "err"}">${c.online ? "在线" : "离线"}</span></td>
                 <td><code>${(c.projects || []).map((p) => c.nodeId + "/" + p).join(", ") || "(无)"}</code></td>
                 <td>${(c.connectedAt || "").replace("T", " ").slice(0, 19)}</td>
-                <td><label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;" title="开启后该子节点可通过 ../ 路径调用本机及其他兄弟节点"><span class="switch"><input type="checkbox" ${c.canCallTree ? "checked" : ""} onchange="grantChild('${c.nodeId}', this.checked)" /><span class="slider"></span></span>允许调用整棵树</label></td>
                 <td><button class="sm danger" onclick="removeChild('${c.nodeId}')">移除/重置</button></td>
               </tr>
             `).join("")}
@@ -683,16 +742,6 @@
       refreshAll();
     }
 
-    async function grantChild(nodeId, canCallTree) {
-      const res = await fetch(`/api/tree/children/${encodeURIComponent(nodeId)}/grant`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ canCallTree })
-      }).then((r) => r.json());
-      toast(res.ok ? `已${canCallTree ? "允许" : "禁止"} ${nodeId} 调用整棵树` : (res.error || "授权失败"));
-      refreshAll();
-    }
-
     function renderOauth() {
       const box = document.getElementById("oauthList");
       const clients = state.oauthClients || [];
@@ -737,6 +786,158 @@
       loadOauth();
     }
 
+    let remoteFormInitialized = false;
+
+    function renderRemote() {
+      const r = state.remote;
+      if (!r) return;
+      document.getElementById("remoteAddress").textContent = r.address || "…";
+      const badge = document.getElementById("remoteBadge");
+      const rv = r.rendezvous || {};
+      if (rv.connected) {
+        badge.className = "tag ok";
+        badge.textContent = "牵线已连接";
+      } else if (rv.configured) {
+        badge.className = "tag err";
+        badge.textContent = "牵线重连中";
+      } else {
+        badge.className = "tag";
+        badge.textContent = "未配置";
+      }
+      document.getElementById("remoteDetail").textContent = rv.lastError || "";
+      const p2p = r.p2p || {};
+      const up = p2p.upnp || {};
+      document.getElementById("p2pStatus").textContent =
+        `P2P：${p2p.listening ? `监听端口 ${p2p.port}` : (p2p.error === "disabled" ? "已停用" : (p2p.error || "未启动"))}` +
+        ` · 候选地址 ${(p2p.candidates || []).join(", ") || "(无)"}` +
+        ` · UPnP：${up.state === "mapped" ? `已映射 ${up.externalAddr}` : (up.state || "disabled")}`;
+      if (!remoteFormInitialized) {
+        document.getElementById("rRvUrl").value = rv.url || "";
+        document.getElementById("swP2p").checked = p2p.enabled !== false;
+        document.getElementById("swUpnp").checked = p2p.upnpEnabled !== false;
+        document.getElementById("rAllow").value = (r.remoteAllowFrom || []).join(",");
+        remoteFormInitialized = true;
+      }
+
+      const aliases = Object.entries(r.remotes || {});
+      const box = document.getElementById("aliasList");
+      if (!aliases.length) {
+        box.innerHTML = '<div class="empty" style="padding:14px;">暂无别名。添加后远端项目会以 <code>/remote/&lt;别名&gt;/mcp</code> 入口暴露给本机 AI。</div>';
+      } else {
+        box.innerHTML = `
+          <table>
+            <thead><tr><th>别名</th><th>节点地址</th><th>给对端 AI 的接入命令</th><th>操作</th></tr></thead>
+            <tbody>
+              ${aliases.map(([alias, addr]) => {
+                const cmd = `claude mcp add --transport http ${alias} http://127.0.0.1:${location.port}/remote/${alias}/mcp --header "Authorization: Bearer <对方客户端 Token>"`;
+                return `
+                <tr>
+                  <td><strong>${alias}</strong></td>
+                  <td><code>${addr}</code></td>
+                  <td>
+                    <code class="box" style="font-size:11px;">${cmd.replace(/</g, "&lt;")}</code>
+                    <button class="sm" onclick="copyText('${cmd.replace(/'/g, "\\'")}', '已复制接入命令')">复制</button>
+                  </td>
+                  <td><button class="sm danger" onclick="delAlias('${alias}')">删除</button></td>
+                </tr>`;
+              }).join("")}
+            </tbody>
+          </table>
+        `;
+      }
+
+      const channels = r.channels || [];
+      const cbox = document.getElementById("channelList");
+      if (!channels.length) {
+        cbox.innerHTML = '<div class="empty" style="padding:14px;">当前没有活跃的远程通道。</div>';
+      } else {
+        cbox.innerHTML = `
+          <table>
+            <thead><tr><th>对端</th><th>方式</th><th>方向</th><th>建立时间</th><th>流量(收/发)</th></tr></thead>
+            <tbody>
+              ${channels.map((c) => `
+                <tr>
+                  <td><code>${c.peer}</code></td>
+                  <td><span class="tag ${c.mode === "direct" ? "ok" : ""}">${c.mode === "direct" ? "直连" : "中继"}</span></td>
+                  <td>${c.direction === "out" ? "呼出" : "呼入"}</td>
+                  <td>${new Date(c.since).toLocaleString("zh-CN", { hour12: false })}</td>
+                  <td>${c.bytesIn} / ${c.bytesOut}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        `;
+      }
+    }
+
+    async function loadRemote() {
+      const res = await fetch("/api/remote").then((r) => r.json()).catch(() => null);
+      if (res && res.address) {
+        state.remote = res;
+        renderRemote();
+      }
+    }
+
+    async function saveRendezvous(enabled) {
+      const body = { enabled, url: document.getElementById("rRvUrl").value.trim() };
+      const token = document.getElementById("rRvToken").value.trim();
+      if (token) body.token = token;
+      const res = await fetch("/api/rendezvous", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }).then((r) => r.json());
+      toast(res.ok ? "牵线服务配置已保存" : (res.error || "保存失败"));
+      const p2pRes = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          p2p: {
+            enabled: document.getElementById("swP2p").checked,
+            upnp: document.getElementById("swUpnp").checked
+          }
+        })
+      }).then((r) => r.json());
+      if (!p2pRes.ok) toast(p2pRes.error || "P2P 开关保存失败");
+      remoteFormInitialized = false;
+      setTimeout(loadRemote, 800);
+    }
+
+    async function addAlias() {
+      const res = await fetch("/api/remote/aliases", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          alias: document.getElementById("rAlias").value.trim(),
+          address: document.getElementById("rAliasAddr").value.trim()
+        })
+      }).then((r) => r.json());
+      toast(res.ok ? "别名已添加" : (res.error || "添加失败"));
+      loadRemote();
+    }
+
+    async function delAlias(alias) {
+      const res = await fetch("/api/remote/aliases", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alias, address: null })
+      }).then((r) => r.json());
+      toast(res.ok ? "别名已删除" : (res.error || "删除失败"));
+      loadRemote();
+    }
+
+    async function saveAllow() {
+      const raw = document.getElementById("rAllow").value.trim();
+      const addresses = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
+      const res = await fetch("/api/remote/allow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ addresses })
+      }).then((r) => r.json());
+      toast(res.ok ? "白名单已保存" : (res.error || "保存失败"));
+      loadRemote();
+    }
+
     async function loadEnv() {
       const res = await fetch("/api/env").then((r) => r.json());
       const box = document.getElementById("envGrid");
@@ -759,6 +960,7 @@
       renderBackups();
       renderLogs();
       loadOauth();
+      loadRemote();
     }
 
     refreshAll();
