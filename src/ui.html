@@ -157,11 +157,11 @@
         </div>
       </div>
       <div>
-        <div class="kv-label">Bearer 鉴权 Token</div>
+        <div class="kv-label">客户端 Token</div>
         <div class="kv-row">
           <code class="box" id="tokenBox">••••••••</code>
           <button class="sm" onclick="toggleTokenMask()">显示</button>
-          <button class="sm" onclick="copyText(state.authToken, '已复制 Token')">复制</button>
+          <button class="sm" onclick="copyText(state.authToken, '已复制客户端 Token')">复制</button>
         </div>
       </div>
       <div>
@@ -501,7 +501,7 @@
       }
       list.innerHTML = `
         <table>
-          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th><th>操作</th></tr></thead>
+          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th><th>授权</th><th>操作</th></tr></thead>
           <tbody>
             ${children.map((c) => `
               <tr>
@@ -509,6 +509,7 @@
                 <td><span class="tag ${c.online ? "ok" : "err"}">${c.online ? "在线" : "离线"}</span></td>
                 <td><code>${(c.projects || []).map((p) => c.nodeId + "/" + p).join(", ") || "(无)"}</code></td>
                 <td>${(c.connectedAt || "").replace("T", " ").slice(0, 19)}</td>
+                <td><label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;" title="开启后该子节点可通过 ../ 路径调用本机及其他兄弟节点"><span class="switch"><input type="checkbox" ${c.canCallTree ? "checked" : ""} onchange="grantChild('${c.nodeId}', this.checked)" /><span class="slider"></span></span>允许调用整棵树</label></td>
                 <td><button class="sm danger" onclick="removeChild('${c.nodeId}')">移除/重置</button></td>
               </tr>
             `).join("")}
@@ -679,6 +680,16 @@
       if (!confirm(`确定移除并重置子节点 "${nodeId}" 的入网绑定？`)) return;
       const res = await fetch(`/api/tree/children/${encodeURIComponent(nodeId)}`, { method: "DELETE" }).then((r) => r.json());
       toast(res.ok ? `已移除 ${nodeId}` : (res.error || "移除失败"));
+      refreshAll();
+    }
+
+    async function grantChild(nodeId, canCallTree) {
+      const res = await fetch(`/api/tree/children/${encodeURIComponent(nodeId)}/grant`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ canCallTree })
+      }).then((r) => r.json());
+      toast(res.ok ? `已${canCallTree ? "允许" : "禁止"} ${nodeId} 调用整棵树` : (res.error || "授权失败"));
       refreshAll();
     }
 

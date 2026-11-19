@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import os from "node:os";
 import { acceptWebSocketUpgrade, connectWebSocket } from "./ws.mjs";
 
+export const PROTOCOL_VERSION = 1;
+
 export function createTreeManager({
   getNodeId,
   getLocalProjects,
@@ -10,6 +12,7 @@ export function createTreeManager({
   getNodeSecret = () => "",
   isDirectEnabled = () => true,
   nodeStore = null,
+  protocolVersion = PROTOCOL_VERSION,
   heartbeatIntervalMs = 25_000,
   directTimeoutMs = 1500,
   directRetryCooldownMs = 60_000,
@@ -112,6 +115,7 @@ export function createTreeManager({
         type: "node/register",
         nodeId: getNodeId(),
         nodeSecret: getNodeSecret(),
+        protocolVersion,
         projects: allProjects
       });
     } catch {
@@ -134,6 +138,28 @@ export function createTreeManager({
       pendingCalls.set(id, { resolve, reject, timer });
       try {
         child.ws.sendJson({ ...frame, id });
+      } catch (err) {
+        pendingCalls.delete(id);
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  }
+
+  function sendUpstreamCall(frame, timeoutMs = 60_000) {
+    if (!upstreamWs || upstreamWs.closed || !upstreamStatus.connected) {
+      return Promise.reject(new Error("当前节点未连接上游，无法访问 ../ 路径。"));
+    }
+    const id = crypto.randomBytes(8).toString("hex");
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingCalls.delete(id);
+        reject(new Error(`调用上游节点超时 (${timeoutMs}ms)。`));
+      }, timeoutMs);
+
+      pendingCalls.set(id, { resolve, reject, timer });
+      try {
+        upstreamWs.sendJson({ ...frame, id });
       } catch (err) {
         pendingCalls.delete(id);
         clearTimeout(timer);
@@ -347,7 +373,7 @@ export function createTreeManager({
 
     let registeredNodeId = null;
 
-    ws.on("message", (raw) => {
+    ws.on("message", async (raw) => {
       let msg;
       try {
         msg = JSON.parse(raw);
@@ -363,6 +389,11 @@ export function createTreeManager({
           ws.close(1008, err.message);
           return;
         }
+        if (msg.protocolVersion !== protocolVersion) {
+          onLog("节点被拒", `${nid} 协议版本不匹配 (parent=${protocolVersion} child=${msg.protocolVersion ?? "missing"})`);
+          ws.close(1008, `protocol version mismatch: parent=${protocolVersion} child=${msg.protocolVersion ?? "missing"}`);
+          return;
+        }
         const nodeSecret = typeof msg.nodeSecret === "string" ? msg.nodeSecret : "";
         if (!/^[0-9a-f]{64}$/i.test(nodeSecret)) {
           onLog("节点被拒", `${nid} 缺少有效 nodeSecret`);
@@ -370,13 +401,13 @@ export function createTreeManager({
           return;
         }
         const secretHash = crypto.createHash("sha256").update(nodeSecret, "utf8").digest("hex");
-        const boundSecret = nodeStore ? nodeStore.get(nid) : null;
-        if (boundSecret && boundSecret !== secretHash) {
+        const binding = nodeStore ? nodeStore.get(nid) : null;
+        if (binding && binding.secretHash !== secretHash) {
           onLog("节点劫持拦截", `${nid} nodeSecret 不匹配，已拒绝冒充连接`);
           ws.close(1008, "nodeId secret mismatch.");
           return;
         }
-        if (!boundSecret && nodeStore) {
+        if (!binding && nodeStore) {
           nodeStore.set(nid, secretHash);
         }
         registeredNodeId = nid;
@@ -388,12 +419,13 @@ export function createTreeManager({
           nodeId: nid,
           ws,
           projects: Array.isArray(msg.projects) ? msg.projects : [],
+          canCallTree: Boolean(binding && binding.canCallTree),
           connectedAt: new Date().toISOString(),
           lastSeen: Date.now(),
           online: true
         });
         onLog("节点上线", `${nid} (${(msg.projects || []).length} 个项目)`);
-        ws.sendJson({ type: "node/registered", ok: true, parentNodeId: getNodeId() });
+        ws.sendJson({ type: "node/registered", ok: true, parentNodeId: getNodeId(), protocolVersion });
         pushRegistrationToUpstream();
         return;
       }
@@ -403,6 +435,23 @@ export function createTreeManager({
           children.get(registeredNodeId).lastSeen = Date.now();
         }
         ws.sendJson({ type: "node/heartbeat_ack", ts: Date.now() });
+        return;
+      }
+
+      if (msg.type === "rpc/upcall" && msg.id) {
+        try {
+          const child = registeredNodeId ? children.get(registeredNodeId) : null;
+          if (!child) {
+            throw new Error("未注册的节点。");
+          }
+          if (!child.canCallTree) {
+            throw new Error(`节点 ${registeredNodeId} 未被授权调用上级（需在上级控制台开启「允许调用整棵树」）`);
+          }
+          const result = await routeToolCall(msg.tool, msg.args || {}, { excludeNodeId: registeredNodeId });
+          ws.sendJson({ type: "rpc/upresponse", id: msg.id, result });
+        } catch (err) {
+          ws.sendJson({ type: "rpc/upresponse", id: msg.id, error: err?.message || String(err) });
+        }
         return;
       }
 
@@ -440,12 +489,52 @@ export function createTreeManager({
     ws.on("error", () => {});
   }
 
-  async function routeToolCall(toolName, args = {}, { allowDirectUpgrade = true } = {}) {
+  async function getProjectsWithUpstream() {
+    const aggregated = getAggregatedProjects({ includeRoot: false });
+    if (!upstreamWs || upstreamWs.closed || !upstreamStatus.connected) {
+      return aggregated;
+    }
+    try {
+      const up = await sendUpstreamCall({ type: "rpc/upcall", tool: "list_projects", args: {} }, 5_000);
+      for (const p of Array.isArray(up) ? up : []) {
+        aggregated.push({ ...p, project: `../${p.project}`, via: "upstream" });
+      }
+    } catch {
+      // ignore
+    }
+    return aggregated;
+  }
+
+  async function routeToolCall(toolName, args = {}, { allowDirectUpgrade = true, excludeNodeId = null } = {}) {
     if (toolName === "list_projects") {
-      return getAggregatedProjects({ includeRoot: false });
+      const aggregated = await getProjectsWithUpstream();
+      if (!excludeNodeId) return aggregated;
+      return aggregated.filter(
+        (p) =>
+          p.via !== excludeNodeId &&
+          p.project !== excludeNodeId &&
+          !(typeof p.project === "string" && p.project.startsWith(`${excludeNodeId}/`))
+      );
     }
 
     const projectRef = args.project;
+    if (typeof projectRef === "string" && projectRef.split("/").includes("..")) {
+      const parts = projectRef.split("/");
+      if (parts[0] !== "..") {
+        throw new Error(`非法的项目路径 "${projectRef}"：".." 只能作为开头的一段或多段使用。`);
+      }
+      const toolTimeout =
+        toolName === "exec_verify"
+          ? Math.max(1000, Math.min(Number(args.timeoutMs) || 30_000, 120_000))
+          : relayBaseTimeoutMs;
+      const callTimeoutMs = toolTimeout + 10_000 + 5_000 * parts.length;
+      directStats.relayCalls += 1;
+      return sendUpstreamCall(
+        { type: "rpc/upcall", tool: toolName, args: { ...args, project: parts.slice(1).join("/") } },
+        callTimeoutMs
+      );
+    }
+
     if (typeof projectRef === "string" && projectRef.includes("/")) {
       const parts = projectRef.split("/");
       const targetNodePath = parts.slice(0, -1).join("/");
@@ -581,6 +670,14 @@ export function createTreeManager({
             lastUpstreamAckAt = Date.now();
             return;
           }
+          if (msg.type === "rpc/upresponse" && msg.id && pendingCalls.has(msg.id)) {
+            const entry = pendingCalls.get(msg.id);
+            pendingCalls.delete(msg.id);
+            clearTimeout(entry.timer);
+            if (msg.error) entry.reject(new Error(msg.error));
+            else entry.resolve(msg.result);
+            return;
+          }
           if (msg.type === "rpc/call" && msg.id) {
             try {
               const result = await routeToolCall(msg.tool, msg.args || {}, { allowDirectUpgrade: false });
@@ -600,11 +697,21 @@ export function createTreeManager({
           }
         });
 
-        ws.on("close", () => {
+        ws.on("close", (code, reason) => {
           clearUpstreamTimers();
           if (upstreamWs === ws) upstreamWs = null;
           upstreamStatus.connected = false;
+          const reasonText = typeof reason === "string" ? reason : String(reason || "");
+          if (reasonText) {
+            upstreamStatus.lastError = `上级关闭 (${code}): ${reasonText}`;
+          } else if (code && code !== 1000) {
+            upstreamStatus.lastError = `连接已关闭 (code=${code})`;
+          }
           if (!stopped && upstreamCfg.enabled) {
+            if (code === 1008) {
+              onLog("上游拒绝", `上级关闭连接 (1008): ${reasonText || "policy violation"}，请修正入网配置后重新保存`);
+              return;
+            }
             const delay = Math.min(2000 * Math.pow(1.5, attempt), 15_000);
             reconnectTimer = setTimeout(() => connectUpstream(upstreamCfg, attempt + 1), delay);
           }
@@ -635,6 +742,7 @@ export function createTreeManager({
       children: Array.from(children.values()).map((c) => ({
         nodeId: c.nodeId,
         online: c.online,
+        canCallTree: Boolean(c.canCallTree),
         connectedAt: c.connectedAt,
         projectCount: (c.projects || []).length,
         projects: (c.projects || []).map((p) => p.project)
@@ -646,6 +754,15 @@ export function createTreeManager({
       })),
       directStats: { ...directStats }
     };
+  }
+
+  function setChildGrant(nodeId, canCallTree) {
+    if (!nodeStore || typeof nodeStore.setGrant !== "function") return false;
+    if (!nodeStore.setGrant(nodeId, Boolean(canCallTree))) return false;
+    const child = children.get(nodeId);
+    if (child) child.canCallTree = Boolean(canCallTree);
+    onLog("节点授权", `${nodeId} 允许调用整棵树 = ${Boolean(canCallTree)}`);
+    return true;
   }
 
   function removeChild(nodeId) {
@@ -715,6 +832,7 @@ export function createTreeManager({
     disconnectUpstream,
     pushRegistrationToUpstream,
     removeChild,
+    setChildGrant,
     getTreeStatus,
     shutdown
   };

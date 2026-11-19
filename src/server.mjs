@@ -10,7 +10,7 @@ import { applyPatch, listBackups, rollbackBackup } from "./patch.mjs";
 import { execVerify, listGlobalSdkCatalog, listSdks } from "./sdk-loader.mjs";
 import { loadSettings, saveSettings } from "./settings.mjs";
 import { checkEnvironment, createTunnelManager } from "./tunnel.mjs";
-import { createTreeManager } from "./tree.mjs";
+import { createTreeManager, PROTOCOL_VERSION } from "./tree.mjs";
 import { createOAuthServer } from "./oauth.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,7 +35,7 @@ const TOOLS = [
       type: "object",
       required: ["project"],
       properties: {
-        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
+        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." },
         paths: { type: "array", items: { type: "string" }, description: "Optional glob/path filters for incremental pull." },
         knownHashes: {
           type: "object",
@@ -55,7 +55,7 @@ const TOOLS = [
       type: "object",
       required: ["project", "patch"],
       properties: {
-        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
+        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." },
         patch: { type: "string", description: "Unified diff patch content." },
         patchSha256: { type: "string", description: "Optional SHA-256 (or MD5) checksum of the patch text to verify transport integrity." },
         expectedHashes: {
@@ -74,7 +74,7 @@ const TOOLS = [
       type: "object",
       required: ["project"],
       properties: {
-        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." }
+        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." }
       }
     }
   },
@@ -86,7 +86,7 @@ const TOOLS = [
       type: "object",
       required: ["project", "script"],
       properties: {
-        project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
+        project: { type: "string", description: "Project alias: local name, '<childNode>/<project>' for subtree nodes, or '../<sibling>/<project>' resolved via the parent (requires the parent's canCallTree grant)." },
         script: { type: "string", description: "Async JS body using `await sdk.<name>.<fn>(...)` (all sdk calls return Promises) and returning a compact summary." },
         timeoutMs: { type: "number", description: "Execution timeout in ms (default 30000, max 120000)." },
         maxOutputBytes: { type: "number", description: "Output/log cap in bytes (default 8192)." }
@@ -199,12 +199,34 @@ export function createBridgeServer(options = {}) {
 
   const nodesFilePath = path.join(bridgeRoot, "nodes.json");
   function loadNodeBindings() {
+    let raw;
     try {
-      const raw = JSON.parse(fs.readFileSync(nodesFilePath, "utf8"));
-      return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+      raw = JSON.parse(fs.readFileSync(nodesFilePath, "utf8"));
     } catch {
       return {};
     }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out = {};
+    let migrated = false;
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "string") {
+        out[k] = { secretHash: v, canCallTree: false };
+        migrated = true;
+      } else if (v && typeof v === "object") {
+        out[k] = { secretHash: typeof v.secretHash === "string" ? v.secretHash : "", canCallTree: Boolean(v.canCallTree) };
+      }
+    }
+    if (migrated) {
+      try {
+        fs.writeFileSync(nodesFilePath, JSON.stringify(out, null, 2) + "\n", "utf8");
+      } catch {
+        // ignore
+      }
+    }
+    return out;
+  }
+  function saveNodeBindings(all) {
+    fs.writeFileSync(nodesFilePath, JSON.stringify(all, null, 2) + "\n", "utf8");
   }
   const nodeStore = {
     get(nodeId) {
@@ -212,14 +234,23 @@ export function createBridgeServer(options = {}) {
     },
     set(nodeId, hash) {
       const all = loadNodeBindings();
-      all[nodeId] = hash;
-      fs.writeFileSync(nodesFilePath, JSON.stringify(all, null, 2) + "\n", "utf8");
+      const prev = all[nodeId];
+      all[nodeId] = { secretHash: hash, canCallTree: Boolean(prev?.canCallTree) };
+      saveNodeBindings(all);
+    },
+    setGrant(nodeId, canCallTree) {
+      const all = loadNodeBindings();
+      const binding = all[nodeId];
+      if (!binding) return false;
+      binding.canCallTree = Boolean(canCallTree);
+      saveNodeBindings(all);
+      return true;
     },
     delete(nodeId) {
       const all = loadNodeBindings();
       if (Object.hasOwn(all, nodeId)) {
         delete all[nodeId];
-        fs.writeFileSync(nodesFilePath, JSON.stringify(all, null, 2) + "\n", "utf8");
+        saveNodeBindings(all);
       }
     }
   };
@@ -294,6 +325,7 @@ export function createBridgeServer(options = {}) {
     getNodeSecret: () => loadSettings(bridgeRoot).nodeSecret,
     isDirectEnabled: () => (options.directEnabled ?? loadSettings(bridgeRoot).directEnabled) !== false,
     nodeStore,
+    protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
     heartbeatIntervalMs: options.heartbeatIntervalMs ?? 25_000,
     directTimeoutMs: options.directTimeoutMs ?? 1500,
     directRetryCooldownMs: options.directRetryCooldownMs ?? 60_000,
@@ -333,6 +365,7 @@ export function createBridgeServer(options = {}) {
         ...SERVER_INFO,
         nodeId: fixedNodeId || loadSettings(bridgeRoot).nodeId,
         authMode,
+        protocolVersion: options.protocolVersion ?? PROTOCOL_VERSION,
         uptimeSec: Math.floor((Date.now() - startedAt) / 1000)
       });
       return;
@@ -454,6 +487,21 @@ export function createBridgeServer(options = {}) {
           const result = rollbackBackup(bridgeRoot, projectCfg, body.backupId);
           recordLog("一键还原", `${body.project} <- ${body.backupId}`);
           sendJson(req, res, 200, result);
+          return;
+        }
+
+        if (req.method === "POST" && /^\/api\/tree\/children\/[^/]+\/grant$/.test(url.pathname)) {
+          const nid = decodeURIComponent(
+            url.pathname.slice("/api/tree/children/".length, -"/grant".length)
+          );
+          const body = JSON.parse(await readBody(req));
+          const ok = tree.setChildGrant(nid, Boolean(body?.canCallTree));
+          if (!ok) {
+            sendJson(req, res, 404, { ok: false, error: `节点 "${nid}" 未绑定。` });
+            return;
+          }
+          recordLog("节点授权", `${nid} 允许调用整棵树 = ${Boolean(body?.canCallTree)}`);
+          sendJson(req, res, 200, { ok: true });
           return;
         }
 

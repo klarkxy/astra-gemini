@@ -9,6 +9,7 @@ import zlib from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBridgeServer } from "../src/server.mjs";
+import { PROTOCOL_VERSION } from "../src/tree.mjs";
 import { acceptWebSocketUpgrade, connectWebSocket } from "../src/ws.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -610,7 +611,7 @@ test("Astra Gemini nodeId TOFU binding: hijack rejected, admin reset allows re-b
     });
     const closeCode = await new Promise((resolve) => {
       evil.on("close", (code) => resolve(code));
-      evil.sendJson({ type: "node/register", nodeId: "kid", nodeSecret: "f".repeat(64), projects: [] });
+      evil.sendJson({ type: "node/register", nodeId: "kid", nodeSecret: "f".repeat(64), protocolVersion: PROTOCOL_VERSION, projects: [] });
     });
     assert.equal(closeCode, 1008);
     assert.equal(kidOnline(), true);
@@ -864,7 +865,7 @@ test("Astra Gemini keepalive: parent sweeps dead children, child reconnects on s
     const ghost = await connectWebSocket(`ws://127.0.0.1:${parentPort}/ws/tree`, {
       headers: { Authorization: "Bearer j" }
     });
-    ghost.sendJson({ type: "node/register", nodeId: "ghost", nodeSecret: "a".repeat(64), projects: [] });
+    ghost.sendJson({ type: "node/register", nodeId: "ghost", nodeSecret: "a".repeat(64), protocolVersion: PROTOCOL_VERSION, projects: [] });
     const ghostOnline = () =>
       (parent.tree.getTreeStatus().children || []).some((c) => c.nodeId === "ghost" && c.online);
     assert.equal(await waitUntil(ghostOnline), true);
@@ -1055,6 +1056,280 @@ test("Astra Gemini OAuth: register rate limit + eviction protects tokened client
     assert.ok((await ref.json()).access_token);
   } finally {
     server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+test("Astra Gemini protocol handshake: version mismatch closed 1008, no auto-reconnect", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-proto-"));
+  const parentDir = makeTempBridgeRoot(tmpBase, "parent");
+  const childDir = makeTempBridgeRoot(tmpBase, "child");
+  fs.writeFileSync(path.join(parentDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(childDir, "projects.json"), "{}", "utf8");
+
+  const parent = createBridgeServer({
+    bridgeRoot: parentDir, nodeId: "root", authMode: "bearer", authToken: "pt", joinToken: "pj"
+  });
+  await new Promise((r) => parent.listen(0, "127.0.0.1", r));
+  const parentPort = parent.address().port;
+  const parentUrl = `http://127.0.0.1:${parentPort}`;
+
+  const child = createBridgeServer({
+    bridgeRoot: childDir, nodeId: "v99", authMode: "bearer", authToken: "ct", joinToken: "cj",
+    protocolVersion: 99,
+    upstream: { enabled: true, url: `ws://127.0.0.1:${parentPort}/ws/tree`, token: "pj" }
+  });
+  await new Promise((r) => child.listen(0, "127.0.0.1", r));
+
+  try {
+    assert.equal(
+      await waitUntil(() => /mismatch/i.test(child.tree.getTreeStatus().upstream.lastError || ""), 5000),
+      true
+    );
+    const up = child.tree.getTreeStatus().upstream;
+    assert.equal(up.connected, false);
+    assert.match(up.lastError, /protocol version mismatch: parent=1 child=99/);
+
+    await new Promise((r) => setTimeout(r, 3000));
+    const st = await fetch(`${parentUrl}/api/status`).then((r) => r.json());
+    const rejects = (st.logs || []).filter(
+      (l) => l.event === "节点被拒" && String(l.detail || "").includes("协议版本不匹配")
+    );
+    assert.equal(rejects.length, 1);
+    assert.ok(!(st.tree.children || []).some((c) => c.nodeId === "v99"));
+    assert.equal(child.tree.getTreeStatus().upstream.connected, false);
+  } finally {
+    child.close();
+    parent.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini sibling routing: ../ via common parent requires canCallTree grant", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-sib-"));
+  const repoA = path.join(tmpBase, "repo-a");
+  const repoB = path.join(tmpBase, "repo-b");
+  initTempGitRepo(repoA);
+  initTempGitRepo(repoB);
+  const rootDir = makeTempBridgeRoot(tmpBase, "root");
+  const aDir = makeTempBridgeRoot(tmpBase, "a");
+  const bDir = makeTempBridgeRoot(tmpBase, "b");
+  fs.writeFileSync(path.join(rootDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(aDir, "projects.json"), JSON.stringify({ demo: { root: repoA, mode: "direct", sdks: ["git"] } }), "utf8");
+  fs.writeFileSync(path.join(bDir, "projects.json"), JSON.stringify({ demo: { root: repoB, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const root = createBridgeServer({
+    bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "rt", joinToken: "rj", heartbeatIntervalMs: 200
+  });
+  await new Promise((r) => root.listen(0, "127.0.0.1", r));
+  const rootPort = root.address().port;
+  const rootUrl = `http://127.0.0.1:${rootPort}`;
+  const up = { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "rj" };
+
+  const nodeA = createBridgeServer({
+    bridgeRoot: aDir, nodeId: "anode", authMode: "bearer", authToken: "at", joinToken: "aj", heartbeatIntervalMs: 200, upstream: up
+  });
+  await new Promise((r) => nodeA.listen(0, "127.0.0.1", r));
+  const aUrl = `http://127.0.0.1:${nodeA.address().port}`;
+
+  const nodeB = createBridgeServer({
+    bridgeRoot: bDir, nodeId: "bnode", authMode: "bearer", authToken: "bt", joinToken: "bj", heartbeatIntervalMs: 200, upstream: up
+  });
+  await new Promise((r) => nodeB.listen(0, "127.0.0.1", r));
+  const bUrl = `http://127.0.0.1:${nodeB.address().port}`;
+
+  const online = (nid) => (root.tree.getTreeStatus().children || []).some((c) => c.nodeId === nid && c.online);
+
+  try {
+    assert.equal(await waitUntil(() => online("anode") && online("bnode")), true);
+
+    const denied = (await rpc(aUrl, "at", "tools/call", {
+      name: "pull_snapshot", arguments: { project: "../bnode/demo" }
+    })).body;
+    assert.equal(denied.result.isError, true);
+    assert.match(denied.result.content[0].text, /未被授权调用上级/);
+
+    const listDenied = (await rpc(aUrl, "at", "tools/call", { name: "list_projects", arguments: {} })).body.result.structuredContent;
+    assert.ok(!listDenied.some((p) => String(p.project).startsWith("../")));
+
+    const grant = await fetch(`${rootUrl}/api/tree/children/anode/grant`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ canCallTree: true })
+    }).then((r) => r.json());
+    assert.equal(grant.ok, true);
+
+    const listOk = (await rpc(aUrl, "at", "tools/call", { name: "list_projects", arguments: {} })).body.result.structuredContent;
+    assert.ok(listOk.some((p) => p.project === "../bnode/demo" && p.via === "upstream"));
+    assert.ok(!listOk.some((p) => String(p.project).startsWith("../anode")));
+
+    const snap = (await rpc(aUrl, "at", "tools/call", {
+      name: "pull_snapshot", arguments: { project: "../bnode/demo" }
+    })).body.result.structuredContent;
+    assert.ok(snap.files.some((f) => f.path === "app.js"));
+
+    const patch = "--- a/app.js\n+++ b/app.js\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 42;\n";
+    const patched = (await rpc(aUrl, "at", "tools/call", {
+      name: "apply_patch", arguments: { project: "../bnode/demo", patch }
+    })).body.result.structuredContent;
+    assert.equal(patched.ok, true, JSON.stringify(patched));
+    assert.equal(fs.readFileSync(path.join(repoB, "app.js"), "utf8"), "export const answer = 42;\n");
+
+    const ex = (await rpc(aUrl, "at", "tools/call", {
+      name: "exec_verify",
+      arguments: { project: "../bnode/demo", script: "const s = await sdk.git.status(); return s.ok && s.branch.length > 0;" }
+    })).body.result.structuredContent;
+    assert.equal(ex.ok, true, JSON.stringify(ex));
+    assert.equal(ex.result, true);
+
+    const deniedB = (await rpc(bUrl, "bt", "tools/call", {
+      name: "pull_snapshot", arguments: { project: "../anode/demo" }
+    })).body;
+    assert.equal(deniedB.result.isError, true);
+    assert.match(deniedB.result.content[0].text, /未被授权调用上级/);
+  } finally {
+    nodeA.close();
+    nodeB.close();
+    root.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini multi-level routing: ../../ hops and mid-level grant revocation", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-multi-"));
+  const repoB = path.join(tmpBase, "repo-b");
+  initTempGitRepo(repoB);
+  const rootDir = makeTempBridgeRoot(tmpBase, "root");
+  const midDir = makeTempBridgeRoot(tmpBase, "mid");
+  const sibDir = makeTempBridgeRoot(tmpBase, "sib");
+  const deepDir = makeTempBridgeRoot(tmpBase, "deep");
+  fs.writeFileSync(path.join(rootDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(midDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(deepDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(sibDir, "projects.json"), JSON.stringify({ demo: { root: repoB, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const root = createBridgeServer({
+    bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "rt", joinToken: "rj", heartbeatIntervalMs: 200
+  });
+  await new Promise((r) => root.listen(0, "127.0.0.1", r));
+  const rootPort = root.address().port;
+  const rootUrl = `http://127.0.0.1:${rootPort}`;
+  const toRoot = { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "rj" };
+
+  const mid = createBridgeServer({
+    bridgeRoot: midDir, nodeId: "mid", authMode: "bearer", authToken: "mt", joinToken: "mj", heartbeatIntervalMs: 200, upstream: toRoot
+  });
+  await new Promise((r) => mid.listen(0, "127.0.0.1", r));
+  const midPort = mid.address().port;
+  const midUrl = `http://127.0.0.1:${midPort}`;
+
+  const sib = createBridgeServer({
+    bridgeRoot: sibDir, nodeId: "sib", authMode: "bearer", authToken: "st", joinToken: "sj", heartbeatIntervalMs: 200, upstream: toRoot
+  });
+  await new Promise((r) => sib.listen(0, "127.0.0.1", r));
+
+  const deep = createBridgeServer({
+    bridgeRoot: deepDir, nodeId: "deep", authMode: "bearer", authToken: "dt", joinToken: "dj", heartbeatIntervalMs: 200,
+    upstream: { enabled: true, url: `ws://127.0.0.1:${midPort}/ws/tree`, token: "mj" }
+  });
+  await new Promise((r) => deep.listen(0, "127.0.0.1", r));
+  const deepUrl = `http://127.0.0.1:${deep.address().port}`;
+
+  try {
+    assert.equal(await waitUntil(() =>
+      ["mid", "sib"].every((n) => (root.tree.getTreeStatus().children || []).some((c) => c.nodeId === n && c.online)) &&
+      (mid.tree.getTreeStatus().children || []).some((c) => c.nodeId === "deep" && c.online)
+    ), true);
+
+    const grantDeep = await fetch(`${midUrl}/api/tree/children/deep/grant`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ canCallTree: true })
+    }).then((r) => r.json());
+    assert.equal(grantDeep.ok, true);
+    const grantMid = await fetch(`${rootUrl}/api/tree/children/mid/grant`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ canCallTree: true })
+    }).then((r) => r.json());
+    assert.equal(grantMid.ok, true);
+
+    const snap = (await rpc(deepUrl, "dt", "tools/call", {
+      name: "pull_snapshot", arguments: { project: "../../sib/demo" }
+    })).body.result.structuredContent;
+    assert.ok(snap.files.some((f) => f.path === "app.js"), JSON.stringify(snap));
+
+    const revoke = await fetch(`${rootUrl}/api/tree/children/mid/grant`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ canCallTree: false })
+    }).then((r) => r.json());
+    assert.equal(revoke.ok, true);
+
+    const denied = (await rpc(deepUrl, "dt", "tools/call", {
+      name: "pull_snapshot", arguments: { project: "../../sib/demo" }
+    })).body;
+    assert.equal(denied.result.isError, true);
+    assert.match(denied.result.content[0].text, /未被授权调用上级/);
+  } finally {
+    deep.close();
+    sib.close();
+    mid.close();
+    root.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini invalid project ref: mid-path .. rejected", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-badref-"));
+  const demoRepo = path.join(tmpBase, "demo-repo");
+  initTempGitRepo(demoRepo);
+  const bridgeDir = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeDir, "projects.json"), JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeDir, nodeId: "solo", authMode: "bearer", authToken: "t", joinToken: "j"
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const res = (await rpc(baseUrl, "t", "tools/call", {
+      name: "pull_snapshot", arguments: { project: "a/../b" }
+    })).body;
+    assert.equal(res.result.isError, true);
+    assert.match(res.result.content[0].text, /只能作为开头/);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini nodes.json migration: legacy string bindings upgraded on registration", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-mig-"));
+  const rootDir = makeTempBridgeRoot(tmpBase, "root");
+  const childDir = makeTempBridgeRoot(tmpBase, "child");
+  fs.writeFileSync(path.join(rootDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(childDir, "projects.json"), "{}", "utf8");
+
+  const nodeSecret = "c".repeat(64);
+  fs.writeFileSync(path.join(childDir, "settings.json"), JSON.stringify({ nodeId: "migkid", nodeSecret }), "utf8");
+  const secretHash = crypto.createHash("sha256").update(nodeSecret, "utf8").digest("hex");
+  fs.writeFileSync(path.join(rootDir, "nodes.json"), JSON.stringify({ migkid: secretHash }), "utf8");
+
+  const root = createBridgeServer({
+    bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "rt", joinToken: "rj", heartbeatIntervalMs: 200
+  });
+  await new Promise((r) => root.listen(0, "127.0.0.1", r));
+  const rootPort = root.address().port;
+
+  const child = createBridgeServer({
+    bridgeRoot: childDir, nodeId: "migkid", authMode: "bearer", authToken: "ct", joinToken: "cj", heartbeatIntervalMs: 200,
+    upstream: { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "rj" }
+  });
+  await new Promise((r) => child.listen(0, "127.0.0.1", r));
+
+  try {
+    const online = () => (root.tree.getTreeStatus().children || []).some((c) => c.nodeId === "migkid" && c.online);
+    assert.equal(await waitUntil(online), true);
+    const bindings = JSON.parse(fs.readFileSync(path.join(rootDir, "nodes.json"), "utf8"));
+    assert.deepEqual(bindings.migkid, { secretHash, canCallTree: false });
+  } finally {
+    child.close();
+    root.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });
