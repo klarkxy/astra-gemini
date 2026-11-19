@@ -91,7 +91,7 @@ $itemOpen = $menu.Items.Add("打开 Astra Gemini 控制台")
 $itemToggle = $menu.Items.Add("停止服务")
 $menu.Items.Add("-") | Out-Null
 $itemCopyUrl = $menu.Items.Add("复制本机 MCP 地址")
-$itemCopyToken = $menu.Items.Add("复制 Bearer Token")
+$itemCopyToken = $menu.Items.Add("复制客户端 Token")
 $itemCopyJoin = $menu.Items.Add("复制入网 Token")
 $itemOpenDir = $menu.Items.Add("打开程序目录")
 $menu.Items.Add("-") | Out-Null
@@ -114,7 +114,7 @@ $itemCopyUrl.Add_Click({
 })
 $itemCopyToken.Add_Click({
   [System.Windows.Forms.Clipboard]::SetText($token)
-  $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制 Bearer Token", [System.Windows.Forms.ToolTipIcon]::Info)
+  $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制客户端 Token（/mcp Bearer 与 OAuth 授权页口令）", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $itemCopyJoin.Add_Click({
   [System.Windows.Forms.Clipboard]::SetText($joinToken)

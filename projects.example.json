@@ -1,17 +1,16 @@
 {
-  "ds-dot": {
-    "root": "H:\\Code\\ds-dot",
+  "my-app": {
+    "root": "C:\\path\\to\\my-app",
     "mode": "direct",
     "sdks": ["git", "pnpm", "npm", "http", "fs_read"],
     "allowedScripts": ["test", "lint", "build"],
-    "deny": [".env*", "**/*.pem"],
-    "description": "Dorothy coordinator plugin for DeepSeek Harness"
+    "deny": ["docs/private/**"],
+    "description": "可读写项目：允许 apply_patch 与 exec_verify"
   },
-  "dsh-plugins": {
-    "root": "H:\\Code\\dsh-plugins",
-    "mode": "direct",
-    "sdks": ["git", "pnpm", "npm", "fs_read", "worktree"],
-    "allowedScripts": ["test", "lint", "check"],
-    "description": "DSH plugins monorepo"
+  "reference-lib": {
+    "root": "C:\\path\\to\\reference-lib",
+    "mode": "readonly",
+    "sdks": ["fs_read"],
+    "description": "只读项目：拒绝 apply_patch，仅保留只读 SDK"
   }
 }
