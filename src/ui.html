@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Astra Gemini 星空双子座 · 本地控制台</title>
+  <style>
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --text: #18181b;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --primary: #4f46e5;
+      --primary-hover: #4338ca;
+      --green: #16a34a;
+      --green-bg: #dcfce7;
+      --amber: #b45309;
+      --amber-bg: #fef3c7;
+      --red: #dc2626;
+      --red-bg: #fee2e2;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1060px; margin: 0 auto; padding: 24px 20px 60px; }
+    header {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 20px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 42px; height: 42px; border-radius: 12px;
+      background: linear-gradient(135deg, #4f46e5, #9333ea);
+      color: #fff; font-weight: 800; font-size: 20px;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 12px rgba(79,70,229,0.28);
+    }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { font-size: 13px; color: var(--muted); }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      background: var(--green-bg); color: var(--green);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+    .banner {
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 16px 18px; margin-bottom: 18px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px;
+    }
+    .kv-label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .kv-row { display: flex; align-items: center; gap: 8px; }
+    code.box {
+      flex: 1; background: #f1f5f9; border: 1px solid var(--border); border-radius: 8px;
+      padding: 6px 10px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    button {
+      border: 1px solid var(--border); background: #fff; color: var(--text);
+      padding: 7px 13px; border-radius: 8px; font-size: 13px; font-weight: 500;
+      cursor: pointer; transition: all .15s;
+    }
+    button:hover { background: #f8fafc; border-color: #cbd5e1; }
+    button.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+    button.primary:hover { background: var(--primary-hover); }
+    button.danger { color: var(--red); border-color: #fecaca; }
+    button.danger:hover { background: var(--red-bg); }
+    button.sm { padding: 4px 10px; font-size: 12px; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .tab {
+      padding: 8px 16px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--card); font-size: 13px; font-weight: 600; color: var(--muted);
+    }
+    .tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    }
+    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+    .tag {
+      display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: #eef2ff; color: var(--primary); font-weight: 600;
+    }
+    .tag.ro { background: var(--amber-bg); color: var(--amber); }
+    .tag.ok { background: var(--green-bg); color: var(--green); }
+    .tag.err { background: var(--red-bg); color: var(--red); }
+    .desc { font-size: 13px; color: var(--muted); margin: 0; }
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0; background: #cbd5e1; border-radius: 24px;
+      transition: .2s; cursor: pointer;
+    }
+    .slider:before {
+      content: ""; position: absolute; width: 18px; height: 18px; left: 3px; bottom: 3px;
+      background: #fff; border-radius: 50%; transition: .2s;
+    }
+    .switch input:checked + .slider { background: var(--primary); }
+    .switch input:checked + .slider:before { transform: translateX(20px); }
+    details summary { font-size: 12px; color: var(--primary); cursor: pointer; user-select: none; }
+    .fn-list { margin: 8px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--muted); }
+    .fn-list li { padding: 4px 0; border-top: 1px dashed var(--border); }
+    .fn-list code { color: var(--text); font-weight: 600; }
+    .form-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 16px; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px; }
+    label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+    input[type="text"], input[type="password"], select {
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+      font-size: 13px; color: var(--text); background: #fff;
+    }
+    .sdk-checks { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 12px; }
+    .sdk-checks label { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+    th { background: #f8fafc; color: var(--muted); font-weight: 600; font-size: 12px; }
+    .toast {
+      position: fixed; right: 20px; bottom: 20px; background: #18181b; color: #fff;
+      padding: 10px 16px; border-radius: 10px; font-size: 13px; opacity: 0;
+      transform: translateY(8px); transition: all .2s; pointer-events: none; z-index: 99;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .empty { padding: 28px; text-align: center; color: var(--muted); font-size: 13px; background: var(--card); border: 1px dashed var(--border); border-radius: var(--radius); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo">✦</div>
+        <div>
+          <h1>Astra Gemini · 星空双子座控制台</h1>
+          <div class="sub">零依赖微内核 · SDK 热开关 · 树状反向 WebSocket 多端组网（仅限本机访问）</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span class="pill"><span class="dot"></span><span id="uptimeText">运行中</span></span>
+        <button onclick="refreshAll()">刷新状态</button>
+      </div>
+    </header>
+
+    <section class="banner">
+      <div>
+        <div class="kv-label">本机 MCP 地址（供 AI 客户端连接）</div>
+        <div class="kv-row">
+          <code class="box" id="localUrl">加载中...</code>
+          <button class="sm" onclick="copyText(state.localMcpUrl, '已复制本机 MCP 地址')">复制</button>
+        </div>
+      </div>
+      <div>
+        <div class="kv-label">Bearer 鉴权 Token</div>
+        <div class="kv-row">
+          <code class="box" id="tokenBox">••••••••</code>
+          <button class="sm" onclick="toggleTokenMask()">显示</button>
+          <button class="sm" onclick="copyText(state.authToken, '已复制 Token')">复制</button>
+        </div>
+      </div>
+      <div>
+        <div class="kv-label">公网临时隧道（Cloudflare Tunnel）</div>
+        <div class="kv-row">
+          <code class="box" id="tunnelUrl">未启动</code>
+          <button class="sm primary" id="tunnelBtn" onclick="toggleTunnel()">一键启动</button>
+          <button class="sm" id="copyTunnelBtn" style="display:none;" onclick="copyText(state.tunnel.mcpUrl, '已复制公网 MCP 地址')">复制</button>
+        </div>
+      </div>
+    </section>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="sdks" onclick="switchTab('sdks')">1. SDK 能力开关</button>
+      <button class="tab" data-tab="projects" onclick="switchTab('projects')">2. 本地项目</button>
+      <button class="tab" data-tab="tree" onclick="switchTab('tree')">3. 星图组网（多端树状）</button>
+      <button class="tab" data-tab="backups" onclick="switchTab('backups')">4. 一键后悔药</button>
+      <button class="tab" data-tab="env" onclick="switchTab('env')">5. 自检 & 日志</button>
+    </nav>
+
+    <section id="panel-sdks" class="panel active">
+      <p class="desc" style="margin-bottom:14px;">拨动开关立即热生效（无需重启）。关闭的 SDK 不会被 AI 看到或调用；随时把自定义 <code>.mjs</code> 丢进 <code>sdks/global/</code> 后点刷新即可上线。</p>
+      <div class="grid" id="sdkGrid"></div>
+    </section>
+
+    <section id="panel-projects" class="panel">
+      <div class="form-card">
+        <div style="font-weight:700;margin-bottom:10px;">添加或修改本地项目</div>
+        <div class="form-grid">
+          <label class="field">项目别名（英文/数字，例如 ds-dot）
+            <input type="text" id="pAlias" placeholder="例如 my-app" />
+          </label>
+          <label class="field">本地文件夹绝对路径
+            <input type="text" id="pRoot" placeholder="例如 H:\Code\my-app" />
+          </label>
+          <label class="field">权限模式
+            <select id="pMode">
+              <option value="direct">可写 + 自动备份（推荐）</option>
+              <option value="readonly">仅只读（只能看代码，禁止改文件）</option>
+            </select>
+          </label>
+          <label class="field">备注（可选）
+            <input type="text" id="pDesc" placeholder="简单记一下这是什么项目" />
+          </label>
+        </div>
+        <div class="kv-label">该项目允许调用的 SDK：</div>
+        <div class="sdk-checks" id="projectSdkChecks"></div>
+        <button class="primary" onclick="saveProjectForm()">保存项目（立即生效）</button>
+      </div>
+      <div id="projectList"></div>
+    </section>
+
+    <section id="panel-tree" class="panel">
+      <div class="form-card">
+        <div class="card-head" style="margin-bottom:10px;">
+          <div>
+            <strong>连接到上游父节点（反向 WebSocket，免公网 IP）</strong>
+            <div class="sub">作为叶子/分支节点主动外连父节点；父节点将能调用本机项目，本机无法反向调用父节点或兄弟节点。</div>
+          </div>
+          <span class="tag" id="upstreamBadge">独立节点</span>
+        </div>
+        <div class="form-grid">
+          <label class="field">本机节点名（nodeId）
+            <input type="text" id="tNodeId" placeholder="例如 home-pc" />
+          </label>
+          <label class="field">上游父节点 WS 地址
+            <input type="text" id="tUpUrl" placeholder="例如 wss://parent.example.com/ws/tree" />
+          </label>
+          <label class="field">上游父节点 Token
+            <input type="password" id="tUpToken" placeholder="粘贴父节点的 Bearer Token" />
+          </label>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+          <button class="primary" onclick="saveUpstream(true)">保存并连接上游</button>
+          <button class="danger" onclick="saveUpstream(false)">断开上游（转为独立根节点）</button>
+          <span class="sub" id="upstreamDetail"></span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <div class="kv-label">让其他设备连入本机（将此地址与上方 Token 填进子节点的“上游父节点”即可）：</div>
+        <div class="kv-row">
+          <code class="box" id="childJoinUrl">ws://127.0.0.1:3939/ws/tree</code>
+          <button class="sm" onclick="copyText(document.getElementById('childJoinUrl').textContent, '已复制子节点接入地址')">复制</button>
+        </div>
+      </div>
+
+      <div class="sub" id="directStatsText" style="margin-bottom:10px;"></div>
+      <div id="childNodeList"></div>
+    </section>
+
+    <section id="panel-backups" class="panel">
+      <p class="desc" style="margin-bottom:14px;">每次 AI 修改本机代码前都会自动留一份原文件底稿。点一下「一键还原」立刻恢复原样。</p>
+      <div id="backupList"></div>
+    </section>
+
+    <section id="panel-env" class="panel">
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head">
+          <strong>电脑环境自检</strong>
+          <button class="sm" onclick="loadEnv()">重新检测</button>
+        </div>
+        <div id="envGrid" style="display:flex;flex-wrap:wrap;gap:10px;"></div>
+      </div>
+      <div class="card">
+        <strong>最近运行日志</strong>
+        <div id="logList"></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let state = { sdks: [], projects: [], backups: [], logs: [], tunnel: {}, tree: {}, authToken: "", localMcpUrl: "", localWsUrl: "" };
+    let showToken = false;
+    let treeFormInitialized = false;
+
+    function toast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.classList.add("show");
+      clearTimeout(window.__t);
+      window.__t = setTimeout(() => el.classList.remove("show"), 2200);
+    }
+
+    async function copyText(text, msg) {
+      if (!text) return toast("暂无可复制内容");
+      try {
+        await navigator.clipboard.writeText(text);
+        toast(msg || "已复制");
+      } catch {
+        prompt("请手动复制：", text);
+      }
+    }
+
+    function switchTab(name) {
+      document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+      document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "panel-" + name));
+      if (name === "env") loadEnv();
+    }
+
+    function toggleTokenMask() {
+      showToken = !showToken;
+      renderHeader();
+    }
+
+    function renderHeader() {
+      document.getElementById("uptimeText").textContent = `节点 ${state.tree?.nodeId || "-"} · 运行 ${state.uptimeSec || 0}s`;
+      document.getElementById("localUrl").textContent = state.localMcpUrl || "";
+      document.getElementById("tokenBox").textContent = state.authMode === "none"
+        ? "未开启鉴权 (none)"
+        : (showToken ? state.authToken : "•".repeat(24));
+
+      const t = state.tunnel || {};
+      const tUrlEl = document.getElementById("tunnelUrl");
+      const tBtn = document.getElementById("tunnelBtn");
+      const cBtn = document.getElementById("copyTunnelBtn");
+      if (t.running) {
+        tUrlEl.textContent = t.mcpUrl || "正在获取公网地址，请稍等几秒...";
+        tBtn.textContent = "停止隧道";
+        tBtn.className = "sm danger";
+        cBtn.style.display = t.mcpUrl ? "inline-block" : "none";
+      } else {
+        tUrlEl.textContent = t.lastError ? `失败: ${t.lastError}` : "未启动（需要电脑已装 cloudflared）";
+        tBtn.textContent = "一键启动";
+        tBtn.className = "sm primary";
+        cBtn.style.display = "none";
+      }
+    }
+
+    function renderSdks() {
+      const grid = document.getElementById("sdkGrid");
+      if (!state.sdks.length) {
+        grid.innerHTML = '<div class="empty">暂未发现 SDK，请在 sdks/global/ 下放置 .mjs 文件。</div>';
+        return;
+      }
+      grid.innerHTML = state.sdks.map((s) => {
+        const fns = Object.entries(s.functions || {}).map(
+          ([k, v]) => `<li><code>${k}</code>：${v.description || v.signature || ""}</li>`
+        ).join("");
+        return `
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div style="font-weight:700;font-size:15px;">${s.title || s.name} <span class="tag">${s.category || "dev"}</span></div>
+                <div class="sub">标识：<code>${s.name}</code></div>
+              </div>
+              <label class="switch" title="开启或关闭此 SDK">
+                <input type="checkbox" ${s.enabled ? "checked" : ""} onchange="toggleSdk('${s.name}', this.checked)" />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <p class="desc">${s.description || ""}</p>
+            <details><summary>查看包含的函数 (${Object.keys(s.functions || {}).length})</summary><ul class="fn-list">${fns}</ul></details>
+          </div>
+        `;
+      }).join("");
+
+      const checks = document.getElementById("projectSdkChecks");
+      if (!checks.children.length) {
+        checks.innerHTML = state.sdks.map((s) => `
+          <label><input type="checkbox" name="projSdk" value="${s.name}" ${s.enabled ? "checked" : ""} /> ${s.name}</label>
+        `).join("");
+      }
+    }
+
+    function renderProjects() {
+      const box = document.getElementById("projectList");
+      if (!state.projects.length) {
+        box.innerHTML = '<div class="empty">还没有添加本地项目，请在上方表单添加本地代码文件夹。</div>';
+        return;
+      }
+      box.innerHTML = `
+        <table>
+          <thead><tr><th>项目别名</th><th>本地路径</th><th>权限</th><th>允许的 SDK</th><th>操作</th></tr></thead>
+          <tbody>
+            ${state.projects.map((p) => `
+              <tr>
+                <td><strong>${p.project}</strong><div class="sub">${p.description || ""}</div></td>
+                <td><code>${p.root || ""}</code> ${p.exists ? '<span class="tag ok">存在</span>' : '<span class="tag err">路径不存在</span>'}</td>
+                <td><span class="tag ${p.mode === "readonly" ? "ro" : "ok"}">${p.mode === "readonly" ? "只读" : "可写+备份"}</span></td>
+                <td><code>${Array.isArray(p.sdks) ? p.sdks.join(", ") : p.sdks}</code></td>
+                <td style="white-space:nowrap;">
+                  <button class="sm" onclick='fillProject(${JSON.stringify(p)})'>编辑</button>
+                  <button class="sm danger" onclick="removeProject('${p.project}')">移除</button>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderTree() {
+      const tr = state.tree || {};
+      const up = tr.upstream || {};
+      if (!treeFormInitialized && state.settings) {
+        document.getElementById("tNodeId").value = state.settings.nodeId || tr.nodeId || "";
+        document.getElementById("tUpUrl").value = state.settings.upstream?.url || "";
+        document.getElementById("tUpToken").value = state.settings.upstream?.token || "";
+        treeFormInitialized = true;
+      }
+      const badge = document.getElementById("upstreamBadge");
+      const detail = document.getElementById("upstreamDetail");
+      if (up.connected) {
+        badge.className = "tag ok";
+        badge.textContent = "已连接上游";
+        detail.textContent = `已连通 ${up.url}`;
+      } else if (up.enabled) {
+        badge.className = "tag err";
+        badge.textContent = "重连中";
+        detail.textContent = up.lastError ? `连接中（${up.lastError}）` : "正在尝试连接上游...";
+      } else {
+        badge.className = "tag";
+        badge.textContent = "独立节点";
+        detail.textContent = "未配置上游父节点";
+      }
+
+      const publicWs = state.tunnel?.publicUrl
+        ? state.tunnel.publicUrl.replace(/^https:\/\//i, "wss://") + "/ws/tree"
+        : state.localWsUrl;
+      document.getElementById("childJoinUrl").textContent = publicWs || "ws://127.0.0.1:3939/ws/tree";
+
+      const list = document.getElementById("childNodeList");
+      const ds = tr.directStats || {};
+      const dts = tr.directTunnels || [];
+      document.getElementById("directStatsText").textContent = `直连隧道：${dts.length} 条活跃（直连调用 ${ds.directCalls || 0} 次 · 自动回退中继 ${ds.relayCalls || 0} 次）`;
+      const children = tr.children || [];
+      if (!children.length) {
+        list.innerHTML = '<div class="empty">当前还没有子节点连入本机。在其他设备填入上方 WS 地址与 Token 后，它们会自动出现在这里。</div>';
+        return;
+      }
+      list.innerHTML = `
+        <table>
+          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th></tr></thead>
+          <tbody>
+            ${children.map((c) => `
+              <tr>
+                <td><strong>${c.nodeId}</strong></td>
+                <td><span class="tag ${c.online ? "ok" : "err"}">${c.online ? "在线" : "离线"}</span></td>
+                <td><code>${(c.projects || []).map((p) => c.nodeId + "/" + p).join(", ") || "(无)"}</code></td>
+                <td>${(c.connectedAt || "").replace("T", " ").slice(0, 19)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderBackups() {
+      const box = document.getElementById("backupList");
+      if (!state.backups.length) {
+        box.innerHTML = '<div class="empty">还没有自动备份记录。当 AI 修改过你的代码后，这里会自动出现可一键还原的快照。</div>';
+        return;
+      }
+      box.innerHTML = `
+        <table>
+          <thead><tr><th>时间</th><th>项目</th><th>改动文件</th><th>操作</th></tr></thead>
+          <tbody>
+            ${state.backups.map((b) => `
+              <tr>
+                <td>${b.createdAt.replace("T", " ").slice(0, 19)}</td>
+                <td><strong>${b.project}</strong></td>
+                <td><code>${(b.files || []).join(", ")}</code></td>
+                <td><button class="sm danger" onclick="rollback('${b.project}', '${b.backupId}')">一键还原</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderLogs() {
+      const box = document.getElementById("logList");
+      if (!state.logs.length) {
+        box.innerHTML = '<div class="sub" style="padding:10px 0;">暂无调用记录。</div>';
+        return;
+      }
+      box.innerHTML = `
+        <table>
+          <thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead>
+          <tbody>
+            ${state.logs.map((l) => `<tr><td>${l.time}</td><td><strong>${l.event}</strong></td><td><code>${l.detail}</code></td></tr>`).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    async function toggleSdk(name, enabled) {
+      const res = await fetch("/api/sdks/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, enabled })
+      }).then((r) => r.json());
+      if (res.ok) {
+        toast(`${name} 已${enabled ? "开启" : "关闭"}（已热生效）`);
+        refreshAll();
+      } else {
+        toast(res.error || "切换失败");
+      }
+    }
+
+    function fillProject(p) {
+      document.getElementById("pAlias").value = p.project;
+      document.getElementById("pRoot").value = p.root || "";
+      document.getElementById("pMode").value = p.mode || "direct";
+      document.getElementById("pDesc").value = p.description || "";
+      document.querySelectorAll('input[name="projSdk"]').forEach((cb) => {
+        cb.checked = p.sdks === "*" || (Array.isArray(p.sdks) && p.sdks.includes(cb.value));
+      });
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    async function saveProjectForm() {
+      const project = document.getElementById("pAlias").value.trim();
+      const root = document.getElementById("pRoot").value.trim();
+      const mode = document.getElementById("pMode").value;
+      const description = document.getElementById("pDesc").value.trim();
+      const sdks = Array.from(document.querySelectorAll('input[name="projSdk"]:checked')).map((c) => c.value);
+
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project, root, mode, description, sdks })
+      }).then((r) => r.json());
+      if (res.ok) {
+        toast(`项目 ${project} 已保存`);
+        refreshAll();
+      } else {
+        toast(res.error || "保存失败");
+      }
+    }
+
+    async function removeProject(id) {
+      if (!confirm(`确定从列表移除项目 "${id}"？（不会删除硬盘上的文件）`)) return;
+      const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => r.json());
+      if (res.ok) {
+        toast(`已移除 ${id}`);
+        refreshAll();
+      }
+    }
+
+    async function saveUpstream(enabled) {
+      const nodeId = document.getElementById("tNodeId").value.trim();
+      const url = document.getElementById("tUpUrl").value.trim();
+      const token = document.getElementById("tUpToken").value.trim();
+      const res = await fetch("/api/tree/upstream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nodeId, enabled, url, token })
+      }).then((r) => r.json());
+      toast(res.ok ? (enabled ? "已开始连接上游父节点..." : "已断开上游连接") : (res.error || "操作失败"));
+      setTimeout(refreshAll, 1200);
+    }
+
+    async function rollback(project, backupId) {
+      if (!confirm(`确定将项目 "${project}" 还原到这次备份前的状态？`)) return;
+      const res = await fetch("/api/backups/rollback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project, backupId })
+      }).then((r) => r.json());
+      toast(res.ok ? "已成功还原原文件！" : (res.error || "还原失败"));
+      refreshAll();
+    }
+
+    async function toggleTunnel() {
+      const endpoint = state.tunnel?.running ? "/api/tunnel/stop" : "/api/tunnel/start";
+      const res = await fetch(endpoint, { method: "POST" }).then((r) => r.json());
+      toast(res.ok ? (state.tunnel?.running ? "隧道已停止" : "正在启动隧道，请稍等 3 秒...") : (res.error || "操作失败"));
+      setTimeout(refreshAll, 2500);
+    }
+
+    async function loadEnv() {
+      const res = await fetch("/api/env").then((r) => r.json());
+      const box = document.getElementById("envGrid");
+      if (!res.ok) return;
+      box.innerHTML = Object.entries(res.env).map(([k, v]) => `
+        <span class="tag ${v.available ? "ok" : "err"}" style="padding:6px 12px;font-size:12px;">
+          ${k}: ${v.available ? (v.version || "已安装") : "未检测到"}
+        </span>
+      `).join("");
+    }
+
+    async function refreshAll() {
+      const res = await fetch("/api/status").then((r) => r.json());
+      if (!res.ok) return;
+      state = res;
+      renderHeader();
+      renderSdks();
+      renderProjects();
+      renderTree();
+      renderBackups();
+      renderLogs();
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 5000);
+  </script>
+</body>
+</html>
