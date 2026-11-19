@@ -1,2 +1,21 @@
-# astra-gemini
-Astra Gemini (星空双子座) — Ultra-lightweight microkernel MCP bridge with incremental hash sync, hot-pluggable local verification SDKs, and Direct-First Reverse WebSocket tree mesh.
+# Astra Gemini（星空双子座）v0.1.0
+
+零外部依赖、小白友好、支持**增量哈希去重同步 + 整包/补丁完整性校验 + 乐观锁 + gzip 传输压缩 + 优先直连/自动回退树状组网**的极简本地代码与验证桥接器。
+
+## 小白三步上手
+
+1. **克隆或解压**到任意目录（例如 `H:\Code\astra-gemini`）。
+2. 右键 `install.ps1` → **使用 PowerShell 运行**（自动检查环境、生成随机 Token、跑全套自检，并在桌面创建「Astra Gemini」快捷方式）。
+3. 双击桌面 **「Astra Gemini」**（或 `Start-AstraGemini.vbs`），无黑框驻留右下角托盘并打开中文控制台。
+
+## 完整性与省流量机制
+
+- **增量去重同步（`knownHashes`）**：调用 `pull_snapshot` 时传入已缓存文件的 SHA-256 或 MD5，未改动文件自动跳过不重传，已删除文件会在 `deleted` 中明确列出，同时附带整包确定性指纹 `bundleSha256`。
+- **补丁整包校验 + 乐观锁（`patchSha256` + `expectedHashes`）**：打补丁前先验补丁本身哈希（防传输截断），再核对目标文件当前哈希（防本地并发修改被覆盖），成功后自动回传 `postHashes` 供云端直接更新缓存，省掉一次二次拉取。
+- **全链路自动 gzip 压缩**：HTTP `/mcp` 接口自动响应 `Accept-Encoding: gzip`（也支持 gzip 请求体），节点间 WebSocket 载荷超过 4 KB 自动走二进制 gzip 帧透明压缩。
+
+## 多端树状组网与安全边界
+
+- **优先直连 + 自动回退 Relay**：通过树状信令交换 15 秒一次性单用票据与可达候选地址，竞速 1.5 秒尝试点对点 `/ws/direct`，建不通则无感回退树状 `/ws/tree` 中继。
+- **7 个热插拔开发 SDK**：`git`、`pnpm`、`npm`、`python`、`http`（仅回环）、`fs_read`、`worktree`（默认关闭），控制台滑动开关即刻生效。
+- **管理控制台隔离**：`/ui` 与 `/api/*` 强制仅允许本机 `127.0.0.1` 访问，外部隧道请求一律 `403`。

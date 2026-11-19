@@ -1,0 +1,17 @@
+{
+  "ds-dot": {
+    "root": "H:\\Code\\ds-dot",
+    "mode": "direct",
+    "sdks": ["git", "pnpm", "npm", "http", "fs_read"],
+    "allowedScripts": ["test", "lint", "build"],
+    "deny": [".env*", "**/*.pem"],
+    "description": "Dorothy coordinator plugin for DeepSeek Harness"
+  },
+  "dsh-plugins": {
+    "root": "H:\\Code\\dsh-plugins",
+    "mode": "direct",
+    "sdks": ["git", "pnpm", "npm", "fs_read", "worktree"],
+    "allowedScripts": ["test", "lint", "check"],
+    "description": "DSH plugins monorepo"
+  }
+}

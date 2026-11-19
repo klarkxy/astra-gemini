@@ -1,0 +1,13 @@
+# Local runtime state & secrets (never commit!)
+projects.json
+settings.json
+token.txt
+start.ps1
+.env
+.env.*
+.bridge-backup/
+.bridge-worktrees/
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

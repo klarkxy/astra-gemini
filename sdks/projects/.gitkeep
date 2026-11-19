@@ -1,0 +1,2 @@
+# Place per-project custom verification SDKs in:
+# sdks/projects/<projectAlias>/<sdkName>.mjs
