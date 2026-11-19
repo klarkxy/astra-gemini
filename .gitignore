@@ -11,3 +11,6 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+join-token.txt
+nodes.json
+oauth-state.json

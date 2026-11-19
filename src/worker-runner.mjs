@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import vm from "node:vm";
-import { pathToFileURL } from "node:url";
+import { spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SANDBOX_PATH = path.join(__dirname, "sandbox-runner.mjs");
 
 async function readStdin() {
   const chunks = [];
@@ -44,15 +47,6 @@ function discoverSdkFiles(bridgeRoot, projectId, allowlist, globalEnabledMap = {
   return Array.from(found.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function formatLogArg(arg) {
-  if (typeof arg === "string") return arg;
-  try {
-    return JSON.stringify(arg);
-  } catch {
-    return String(arg);
-  }
-}
-
 async function main() {
   const raw = await readStdin();
   const payload = JSON.parse(raw);
@@ -62,7 +56,8 @@ async function main() {
     projectCfg = null,
     globalSdkEnabled = {},
     script,
-    maxOutputBytes = 8192
+    maxOutputBytes = 8192,
+    timeoutMs = 30_000
   } = payload;
 
   if (action === "catalog") {
@@ -109,6 +104,16 @@ async function main() {
   }
 
   if (action === "exec") {
+    if (!process.allowedNodeEnvironmentFlags?.has("--allow-net")) {
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          error: "exec_verify 需要 Node.js >= 25（权限模型需支持网络限制）。"
+        })
+      );
+      return;
+    }
+
     const sdkNamespace = Object.create(null);
     const ctx = {
       bridgeRoot,
@@ -123,84 +128,135 @@ async function main() {
     }
     Object.freeze(sdkNamespace);
 
-    const logs = [];
-    let logBytes = 0;
-    let truncated = false;
-
-    const pushLog = (level, args) => {
-      const line = `[${level}] ${args.map(formatLogArg).join(" ")}`;
-      if (logBytes + line.length > maxOutputBytes) {
-        truncated = true;
-        return;
-      }
-      logs.push(line);
-      logBytes += line.length + 1;
-    };
-
-    const sandbox = {
-      sdk: sdkNamespace,
-      console: Object.freeze({
-        log: (...a) => pushLog("log", a),
-        info: (...a) => pushLog("info", a),
-        warn: (...a) => pushLog("warn", a),
-        error: (...a) => pushLog("error", a)
-      }),
-      JSON,
-      Math,
-      Date,
-      Promise,
-      Array,
-      Object,
-      String,
-      Number,
-      Boolean,
-      RegExp,
-      Map,
-      Set,
-      URL,
-      Error,
-      TypeError,
-      setTimeout,
-      clearTimeout
-    };
-
-    const wrapped = `(async () => {\n${script}\n})()`;
-    const started = Date.now();
-    try {
-      const vmContext = vm.createContext(sandbox);
-      const compiled = new vm.Script(wrapped, { filename: "verify-script.mjs" });
-      const result = await compiled.runInContext(vmContext);
-      let serializedResult = result;
-      try {
-        const str = JSON.stringify(result);
-        if (str && str.length > maxOutputBytes) {
-          truncated = true;
-          serializedResult = str.slice(0, maxOutputBytes) + "... [truncated]";
-        }
-      } catch {
-        serializedResult = String(result);
-      }
-
-      process.stdout.write(
-        JSON.stringify({
-          ok: true,
-          durationMs: Date.now() - started,
-          truncated,
-          logs,
-          result: serializedResult ?? null
-        })
-      );
-    } catch (err) {
-      process.stdout.write(
-        JSON.stringify({
-          ok: false,
-          durationMs: Date.now() - started,
-          truncated,
-          logs,
-          error: err?.message || String(err)
-        })
-      );
+    const sdkShape = {};
+    for (const [name, sdkObj] of Object.entries(sdkNamespace)) {
+      sdkShape[name] = Object.keys(sdkObj).filter((k) => typeof sdkObj[k] === "function");
     }
+
+    const clampedTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 30_000, 120_000));
+    const sandboxEnv = {};
+    if (process.platform === "win32" && process.env.SystemRoot) {
+      sandboxEnv.SystemRoot = process.env.SystemRoot;
+    }
+
+    const child = spawn(
+      process.execPath,
+      ["--permission", `--allow-fs-read=${SANDBOX_PATH}`, SANDBOX_PATH],
+      {
+        cwd: projectCfg?.root || bridgeRoot,
+        env: sandboxEnv,
+        stdio: ["ignore", "pipe", "pipe", "ipc"]
+      }
+    );
+
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      const stderrChunks = [];
+      let stderrBytes = 0;
+
+      const finish = (obj) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(obj);
+      };
+
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+        finish({
+          ok: false,
+          timedOut: true,
+          error: `Verification script timed out after ${clampedTimeout}ms.`
+        });
+      }, clampedTimeout);
+
+      child.stdout.resume();
+      child.stderr.on("data", (c) => {
+        if (stderrBytes < 8192) {
+          stderrChunks.push(c);
+          stderrBytes += c.length;
+        }
+      });
+
+      child.on("message", async (msg) => {
+        if (!msg || typeof msg !== "object") return;
+        if (msg.type === "call") {
+          const reply = (ok, valueOrError) => {
+            try {
+              child.send(
+                ok
+                  ? { type: "result", id: msg.id, ok: true, value: valueOrError }
+                  : { type: "result", id: msg.id, ok: false, error: valueOrError }
+              );
+            } catch {
+              // ignore
+            }
+          };
+          const { sdk, fn, args } = msg;
+          if (
+            typeof sdk !== "string" ||
+            typeof fn !== "string" ||
+            !Array.isArray(args) ||
+            !Object.hasOwn(sdkNamespace, sdk) ||
+            !Object.hasOwn(sdkNamespace[sdk], fn) ||
+            typeof sdkNamespace[sdk][fn] !== "function"
+          ) {
+            reply(false, "Unknown SDK function.");
+            return;
+          }
+          try {
+            const value = await sdkNamespace[sdk][fn](...args);
+            reply(true, JSON.parse(JSON.stringify(value ?? null)));
+          } catch (err) {
+            reply(false, err?.message || String(err));
+          }
+          return;
+        }
+        if (msg.type === "done") {
+          finish(
+            msg.ok
+              ? {
+                  ok: true,
+                  durationMs: msg.durationMs,
+                  truncated: msg.truncated,
+                  logs: msg.logs,
+                  result: msg.result ?? null
+                }
+              : {
+                  ok: false,
+                  durationMs: msg.durationMs,
+                  truncated: msg.truncated,
+                  logs: msg.logs,
+                  error: msg.error || "Verification script failed."
+                }
+          );
+        }
+      });
+
+      child.on("error", (err) => {
+        finish({ ok: false, error: err.message });
+      });
+
+      child.on("close", (code) => {
+        const errOut = Buffer.concat(stderrChunks).toString("utf8").trim();
+        finish({
+          ok: false,
+          error: errOut.slice(0, 2000) || `Sandbox exited without result (code ${code}).`
+        });
+      });
+
+      try {
+        child.send({ type: "run", script, maxOutputBytes, sdkShape });
+      } catch (err) {
+        finish({ ok: false, error: err.message });
+      }
+    });
+
+    process.stdout.write(JSON.stringify(result));
     return;
   }
 

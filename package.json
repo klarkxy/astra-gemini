@@ -4,7 +4,7 @@
   "description": "Astra Gemini (星空双子座) — Ultra-lightweight microkernel MCP bridge with incremental hash sync, bundle/patch integrity, optimistic lock, gzip compression, hot-pluggable SDKs, and Direct-First WS tree mesh.",
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=25.0.0"
   },
   "scripts": {
     "start": "node src/server.mjs",

@@ -7,8 +7,13 @@ export function createTreeManager({
   getLocalProjects,
   executeLocalTool,
   getDirectCandidates = () => [],
+  getNodeSecret = () => "",
+  isDirectEnabled = () => true,
+  nodeStore = null,
+  heartbeatIntervalMs = 25_000,
   directTimeoutMs = 1500,
   directRetryCooldownMs = 60_000,
+  relayBaseTimeoutMs = 60_000,
   onLog = () => {}
 }) {
   const children = new Map();
@@ -28,9 +33,24 @@ export function createTreeManager({
   let upstreamCfg = { enabled: false, url: "", token: "" };
   let upstreamWs = null;
   let upstreamStatus = { connected: false, url: "", lastError: null, connectedAt: null };
+  let lastUpstreamAckAt = 0;
   let reconnectTimer = null;
   let heartbeatTimer = null;
   let stopped = false;
+
+  const childSweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const c of children.values()) {
+      if (c.online && c.ws && !c.ws.closed && now - (c.lastSeen || 0) > heartbeatIntervalMs * 3) {
+        onLog("心跳超时", `${c.nodeId} 超过 ${heartbeatIntervalMs * 3}ms 未收到心跳，已断开`);
+        try {
+          c.ws.terminate();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }, heartbeatIntervalMs);
 
   function sanitizeNodeId(id) {
     if (typeof id !== "string" || !/^[a-zA-Z0-9_-]{1,48}$/.test(id)) {
@@ -91,6 +111,7 @@ export function createTreeManager({
       upstreamWs.sendJson({
         type: "node/register",
         nodeId: getNodeId(),
+        nodeSecret: getNodeSecret(),
         projects: allProjects
       });
     } catch {
@@ -342,6 +363,22 @@ export function createTreeManager({
           ws.close(1008, err.message);
           return;
         }
+        const nodeSecret = typeof msg.nodeSecret === "string" ? msg.nodeSecret : "";
+        if (!/^[0-9a-f]{64}$/i.test(nodeSecret)) {
+          onLog("节点被拒", `${nid} 缺少有效 nodeSecret`);
+          ws.close(1008, "Missing nodeSecret.");
+          return;
+        }
+        const secretHash = crypto.createHash("sha256").update(nodeSecret, "utf8").digest("hex");
+        const boundSecret = nodeStore ? nodeStore.get(nid) : null;
+        if (boundSecret && boundSecret !== secretHash) {
+          onLog("节点劫持拦截", `${nid} nodeSecret 不匹配，已拒绝冒充连接`);
+          ws.close(1008, "nodeId secret mismatch.");
+          return;
+        }
+        if (!boundSecret && nodeStore) {
+          nodeStore.set(nid, secretHash);
+        }
         registeredNodeId = nid;
         const prev = children.get(nid);
         if (prev && prev.ws && prev.ws !== ws && !prev.ws.closed) {
@@ -414,12 +451,19 @@ export function createTreeManager({
       const targetNodePath = parts.slice(0, -1).join("/");
       const leafProjectName = parts[parts.length - 1];
 
-      if (allowDirectUpgrade) {
+      const hopsRemaining = Math.max(0, parts.length - 2);
+      const toolTimeout =
+        toolName === "exec_verify"
+          ? Math.max(1000, Math.min(Number(args.timeoutMs) || 30_000, 120_000))
+          : relayBaseTimeoutMs;
+      const callTimeoutMs = toolTimeout + 10_000 + 5_000 * hopsRemaining;
+
+      if (allowDirectUpgrade && isDirectEnabled()) {
         const direct = await tryEstablishDirectTunnel(targetNodePath);
         if (direct) {
           try {
             directStats.directCalls += 1;
-            return await sendDirectRpc(targetNodePath, toolName, { ...args, project: leafProjectName });
+            return await sendDirectRpc(targetNodePath, toolName, { ...args, project: leafProjectName }, callTimeoutMs);
           } catch {
             directTunnels.delete(targetNodePath);
             directStats.directFallbacks += 1;
@@ -430,11 +474,15 @@ export function createTreeManager({
       directStats.relayCalls += 1;
       const firstHop = parts[0];
       const subProject = parts.slice(1).join("/");
-      return sendDownwardFrame(firstHop, {
-        type: "rpc/call",
-        tool: toolName,
-        args: { ...args, project: subProject }
-      });
+      return sendDownwardFrame(
+        firstHop,
+        {
+          type: "rpc/call",
+          tool: toolName,
+          args: { ...args, project: subProject }
+        },
+        callTimeoutMs
+      );
     }
 
     return executeLocalTool(toolName, args);
@@ -493,6 +541,8 @@ export function createTreeManager({
           return;
         }
         upstreamWs = ws;
+        attempt = 0;
+        lastUpstreamAckAt = Date.now();
         upstreamStatus = {
           connected: true,
           url: wsUrl,
@@ -503,20 +553,32 @@ export function createTreeManager({
         pushRegistrationToUpstream();
 
         heartbeatTimer = setInterval(() => {
-          if (upstreamWs && !upstreamWs.closed) {
+          if (!upstreamWs || upstreamWs.closed) return;
+          if (Date.now() - lastUpstreamAckAt > heartbeatIntervalMs * 3) {
+            onLog("上游心跳超时", "未收到 heartbeat_ack，正在断开重连");
             try {
-              upstreamWs.sendJson({ type: "node/heartbeat", nodeId: getNodeId() });
+              upstreamWs.terminate();
             } catch {
               // ignore
             }
+            return;
           }
-        }, 25_000);
+          try {
+            upstreamWs.sendJson({ type: "node/heartbeat", nodeId: getNodeId() });
+          } catch {
+            // ignore
+          }
+        }, heartbeatIntervalMs);
 
         ws.on("message", async (raw) => {
           let msg;
           try {
             msg = JSON.parse(raw);
           } catch {
+            return;
+          }
+          if (msg.type === "node/heartbeat_ack") {
+            lastUpstreamAckAt = Date.now();
             return;
           }
           if (msg.type === "rpc/call" && msg.id) {
@@ -586,8 +648,29 @@ export function createTreeManager({
     };
   }
 
+  function removeChild(nodeId) {
+    if (nodeStore) nodeStore.delete(nodeId);
+    const entry = children.get(nodeId);
+    if (!entry) {
+      pushRegistrationToUpstream();
+      return false;
+    }
+    children.delete(nodeId);
+    if (entry.ws && !entry.ws.closed) {
+      try {
+        entry.ws.close(1000, "Removed by admin");
+      } catch {
+        // ignore
+      }
+    }
+    onLog("节点移除", nodeId);
+    pushRegistrationToUpstream();
+    return true;
+  }
+
   function shutdown() {
     stopped = true;
+    clearInterval(childSweepTimer);
     disconnectUpstream();
     for (const t of directTunnels.values()) {
       try {
@@ -631,6 +714,7 @@ export function createTreeManager({
     connectUpstream,
     disconnectUpstream,
     pushRegistrationToUpstream,
+    removeChild,
     getTreeStatus,
     shutdown
   };

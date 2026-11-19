@@ -1,0 +1,15 @@
+[Unit]
+Description=Astra Gemini MCP bridge
+After=network.target
+
+[Service]
+Type=simple
+User=astra
+WorkingDirectory=/opt/astra-gemini
+EnvironmentFile=/etc/astra-gemini.env
+ExecStart=/usr/bin/node src/server.mjs
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

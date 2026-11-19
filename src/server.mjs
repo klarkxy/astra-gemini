@@ -11,6 +11,7 @@ import { execVerify, listGlobalSdkCatalog, listSdks } from "./sdk-loader.mjs";
 import { loadSettings, saveSettings } from "./settings.mjs";
 import { checkEnvironment, createTunnelManager } from "./tunnel.mjs";
 import { createTreeManager } from "./tree.mjs";
+import { createOAuthServer } from "./oauth.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRIDGE_ROOT = path.resolve(__dirname, "..");
@@ -23,11 +24,13 @@ const TOOLS = [
   {
     name: "list_projects",
     description: "List all registered local projects and online subtree projects across connected Astra Gemini nodes.",
+    annotations: { readOnlyHint: true },
     inputSchema: { type: "object", properties: {} }
   },
   {
     name: "pull_snapshot",
     description: "Pull a filtered text code snapshot with bundleSha256 and optional incremental deduplication via knownHashes (SHA-256 or MD5).",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: "object",
       required: ["project"],
@@ -47,6 +50,7 @@ const TOOLS = [
   {
     name: "apply_patch",
     description: "Validate (optional patchSha256 + expectedHashes optimistic lock + git apply --check), auto-backup, apply a unified diff patch, and return postHashes.",
+    annotations: { readOnlyHint: false, destructiveHint: true },
     inputSchema: {
       type: "object",
       required: ["project", "patch"],
@@ -65,6 +69,7 @@ const TOOLS = [
   {
     name: "list_sdks",
     description: "Hot-reload and list all verification SDKs currently enabled for a local or subtree project.",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: "object",
       required: ["project"],
@@ -75,13 +80,14 @@ const TOOLS = [
   },
   {
     name: "exec_verify",
-    description: "Execute a short async JS verification script in an isolated process on the target node with ONLY its enabled `sdk` namespace.",
+    description: "Execute a short async JS verification script in a permission-sandboxed process on the target node with ONLY its enabled `sdk` namespace. Every `sdk.*` call crosses an IPC boundary and returns a Promise, so all calls must be awaited.",
+    annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
       required: ["project", "script"],
       properties: {
         project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
-        script: { type: "string", description: "Async JS body using `sdk.<name>.<fn>(...)` and returning a compact summary." },
+        script: { type: "string", description: "Async JS body using `await sdk.<name>.<fn>(...)` (all sdk calls return Promises) and returning a compact summary." },
         timeoutMs: { type: "number", description: "Execution timeout in ms (default 30000, max 120000)." },
         maxOutputBytes: { type: "number", description: "Output/log cap in bytes (default 8192)." }
       }
@@ -135,6 +141,16 @@ function isDirectLocalhost(req) {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
+function adminHostName(hostHeader) {
+  const host = String(hostHeader || "").trim();
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    return end === -1 ? "" : host.slice(1, end);
+  }
+  if (host.indexOf(":") !== host.lastIndexOf(":")) return host;
+  return host.split(":")[0];
+}
+
 async function executeLocalTool(bridgeRoot, projectsConfigPath, name, args = {}) {
   if (name === "list_projects") {
     return listProjects(projectsConfigPath);
@@ -162,10 +178,11 @@ export function createBridgeServer(options = {}) {
   const port = Number(options.port || process.env.PORT || 3939);
   const authMode = options.authMode ?? process.env.AUTH_MODE ?? "bearer";
   const authToken = options.authToken ?? process.env.ASTRA_TOKEN ?? process.env.KIMI_BRIDGE_TOKEN ?? "";
+  const joinToken = options.joinToken ?? process.env.ASTRA_JOIN_TOKEN ?? "";
   const fixedNodeId = options.nodeId || process.env.ASTRA_NODE_ID || null;
   const startedAt = Date.now();
   const recentLogs = [];
-  const tunnel = createTunnelManager(port);
+  const tunnel = createTunnelManager(port, () => loadSettings(bridgeRoot).tunnel);
 
   if (authMode === "bearer" && !authToken) {
     throw new Error("AUTH_MODE=bearer requires ASTRA_TOKEN (or KIMI_BRIDGE_TOKEN) to be set.");
@@ -180,25 +197,107 @@ export function createBridgeServer(options = {}) {
     if (recentLogs.length > 60) recentLogs.length = 60;
   }
 
-  function isAuthorized(req) {
+  const nodesFilePath = path.join(bridgeRoot, "nodes.json");
+  function loadNodeBindings() {
+    try {
+      const raw = JSON.parse(fs.readFileSync(nodesFilePath, "utf8"));
+      return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    } catch {
+      return {};
+    }
+  }
+  const nodeStore = {
+    get(nodeId) {
+      return loadNodeBindings()[nodeId] || null;
+    },
+    set(nodeId, hash) {
+      const all = loadNodeBindings();
+      all[nodeId] = hash;
+      fs.writeFileSync(nodesFilePath, JSON.stringify(all, null, 2) + "\n", "utf8");
+    },
+    delete(nodeId) {
+      const all = loadNodeBindings();
+      if (Object.hasOwn(all, nodeId)) {
+        delete all[nodeId];
+        fs.writeFileSync(nodesFilePath, JSON.stringify(all, null, 2) + "\n", "utf8");
+      }
+    }
+  };
+
+  function getIssuer(req) {
+    const s = loadSettings(bridgeRoot);
+    const configured =
+      options.publicUrl ||
+      process.env.ASTRA_PUBLIC_URL ||
+      s.publicUrl ||
+      (s.tunnel && s.tunnel.mode === "named" ? s.tunnel.publicUrl : "") ||
+      "";
+    if (configured) return configured.replace(/\/+$/, "");
+    const host = String(req?.headers?.host || "localhost");
+    const fwd = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+    let proto = fwd === "http" || fwd === "https" ? fwd : null;
+    if (!proto && (req?.headers?.["cf-ray"] || req?.headers?.["cf-visitor"])) {
+      proto = "https";
+    }
+    if (!proto) proto = "http";
+    const hostName = adminHostName(host).toLowerCase();
+    if (!warnedIssuerFallback && !["127.0.0.1", "localhost", "::1"].includes(hostName)) {
+      warnedIssuerFallback = true;
+      recordLog("未配置 publicUrl", "OAuth issuer 由请求 Host 推断，请在设置中配置公网地址");
+    }
+    return `${proto}://${host}`;
+  }
+
+  const oauth = createOAuthServer({
+    getIssuer,
+    statePath: path.join(bridgeRoot, "oauth-state.json"),
+    verifyPassword: (pw) => tokenEqual(authToken, pw),
+    maxClients: options.oauthMaxClients,
+    registerLimit: options.oauthRegisterLimit,
+    registerWindowMs: options.oauthRegisterWindowMs
+  });
+
+  function tokenEqual(expected, actual) {
+    const a = Buffer.from(String(expected ?? ""), "utf8");
+    const b = Buffer.from(String(actual ?? ""), "utf8");
+    return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
+  function bearerToken(req) {
+    const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || "");
+    return match ? match[1] : null;
+  }
+
+  function isClientAuthorized(req) {
     if (authMode === "none") return true;
-    const header = req.headers.authorization || "";
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    if (!match) return false;
-    const expected = Buffer.from(authToken);
-    const actual = Buffer.from(match[1]);
-    if (expected.length !== actual.length) return false;
-    return crypto.timingSafeEqual(expected, actual);
+    const token = bearerToken(req);
+    if (!token) return false;
+    if (tokenEqual(authToken, token)) return true;
+    return oauth.isAccessTokenValid(token);
+  }
+
+  function isJoinAuthorized(req) {
+    if (authMode === "none") return true;
+    const token = bearerToken(req);
+    if (!token || !joinToken) return false;
+    return tokenEqual(joinToken, token);
   }
 
   let serverRef = null;
+  let warnedNoJoinToken = false;
+  let warnedIssuerFallback = false;
 
   const tree = createTreeManager({
     getNodeId: () => fixedNodeId || loadSettings(bridgeRoot).nodeId,
     getLocalProjects: (opts) => listProjects(projectsConfigPath, opts),
     executeLocalTool: (tool, args) => executeLocalTool(bridgeRoot, projectsConfigPath, tool, args),
+    getNodeSecret: () => loadSettings(bridgeRoot).nodeSecret,
+    isDirectEnabled: () => (options.directEnabled ?? loadSettings(bridgeRoot).directEnabled) !== false,
+    nodeStore,
+    heartbeatIntervalMs: options.heartbeatIntervalMs ?? 25_000,
     directTimeoutMs: options.directTimeoutMs ?? 1500,
     directRetryCooldownMs: options.directRetryCooldownMs ?? 60_000,
+    relayBaseTimeoutMs: options.relayBaseTimeoutMs ?? 60_000,
     getDirectCandidates: () => {
       if (Array.isArray(options.directCandidates)) return options.directCandidates;
       const list = [];
@@ -207,7 +306,9 @@ export function createBridgeServer(options = {}) {
       if (tStatus.publicUrl) {
         list.push(tStatus.publicUrl.replace(/^https:\/\//i, "wss://") + "/ws/direct");
       }
-      list.push(...tree.listLocalLanCandidates(actualPort));
+      if ((options.advertiseLan ?? loadSettings(bridgeRoot).advertiseLan) !== false) {
+        list.push(...tree.listLocalLanCandidates(actualPort));
+      }
       return list;
     },
     onLog: recordLog
@@ -219,7 +320,12 @@ export function createBridgeServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    let url;
+    try {
+      url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    } catch {
+      url = new URL(req.url || "/", "http://localhost");
+    }
 
     if (req.method === "GET" && url.pathname === "/health") {
       sendJson(req, res, 200, {
@@ -232,9 +338,32 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
+    if (url.pathname.startsWith("/.well-known/") || url.pathname.startsWith("/oauth/")) {
+      const handled = await oauth.handleRequest(req, res, url);
+      if (!handled) {
+        sendJson(req, res, 404, { error: "Not found." });
+      }
+      return;
+    }
+
     if (url.pathname === "/" || url.pathname === "/ui" || url.pathname.startsWith("/api/")) {
       if (!isDirectLocalhost(req)) {
         sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截外部隧道请求。" });
+        return;
+      }
+
+      const hostHeader = String(req.headers.host || "");
+      const hostName = adminHostName(hostHeader).toLowerCase();
+      if (!["127.0.0.1", "localhost", "::1"].includes(hostName)) {
+        sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截非法 Host 请求。" });
+        return;
+      }
+      if (req.headers.origin !== undefined && req.headers.origin !== `http://${hostHeader}`) {
+        sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Origin 校验失败)。" });
+        return;
+      }
+      if (req.headers["sec-fetch-site"] === "cross-site") {
+        sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Sec-Fetch-Site: cross-site)。" });
         return;
       }
 
@@ -252,6 +381,15 @@ export function createBridgeServer(options = {}) {
         if (req.method === "GET" && url.pathname === "/api/status") {
           const catalog = await listGlobalSdkCatalog(bridgeRoot);
           const settings = loadSettings(bridgeRoot);
+          const safeSettings = {
+            ...settings,
+            nodeSecret: undefined,
+            tunnel: {
+              mode: settings.tunnel?.mode || "quick",
+              publicUrl: settings.tunnel?.publicUrl || "",
+              hasToken: Boolean(settings.tunnel?.token)
+            }
+          };
           sendJson(req, res, 200, {
             ok: true,
             server: SERVER_INFO,
@@ -259,12 +397,15 @@ export function createBridgeServer(options = {}) {
             localWsUrl: `ws://127.0.0.1:${port}/ws/tree`,
             authMode,
             authToken,
+            joinToken,
+            hasJoinToken: Boolean(joinToken) || authMode === "none",
+            publicUrl: getIssuer(req),
             uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
-            settings,
+            settings: safeSettings,
             projects: listProjects(projectsConfigPath, { includeRoot: true }),
             sdks: catalog.sdks || [],
             backups: listBackups(bridgeRoot),
-            tunnel: tunnel.status(),
+            tunnel: { ...tunnel.status(), hasToken: Boolean(settings.tunnel?.token) },
             tree: tree.getTreeStatus(),
             logs: recentLogs
           });
@@ -313,6 +454,64 @@ export function createBridgeServer(options = {}) {
           const result = rollbackBackup(bridgeRoot, projectCfg, body.backupId);
           recordLog("一键还原", `${body.project} <- ${body.backupId}`);
           sendJson(req, res, 200, result);
+          return;
+        }
+
+        if (req.method === "DELETE" && url.pathname.startsWith("/api/tree/children/")) {
+          const nid = decodeURIComponent(url.pathname.slice("/api/tree/children/".length));
+          const removed = tree.removeChild(nid);
+          recordLog("移除子节点", nid);
+          sendJson(req, res, 200, { ok: true, removed });
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/oauth") {
+          sendJson(req, res, 200, { ok: true, issuer: getIssuer(req), clients: oauth.listClients() });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/oauth/revoke-all") {
+          let body = {};
+          try {
+            body = JSON.parse(await readBody(req));
+          } catch {
+            body = {};
+          }
+          oauth.revokeAll({ dropClients: Boolean(body?.dropClients) });
+          recordLog("OAuth 撤销", body?.dropClients ? "已清空全部令牌与客户端" : "已撤销全部访问令牌");
+          sendJson(req, res, 200, { ok: true });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/tunnel/config") {
+          const body = JSON.parse(await readBody(req));
+          const mode = body.mode === "named" ? "named" : "quick";
+          const prevTunnel = loadSettings(bridgeRoot).tunnel || {};
+          const tunnelCfg = {
+            mode,
+            token: typeof body.token === "string" ? body.token.trim() : prevTunnel.token || "",
+            publicUrl: typeof body.publicUrl === "string" ? body.publicUrl.trim() : prevTunnel.publicUrl || ""
+          };
+          saveSettings(bridgeRoot, { tunnel: tunnelCfg });
+          recordLog("隧道配置", `模式=${mode}${tunnelCfg.publicUrl ? ` (${tunnelCfg.publicUrl})` : ""}`);
+          sendJson(req, res, 200, {
+            ok: true,
+            tunnel: { mode, publicUrl: tunnelCfg.publicUrl, hasToken: Boolean(tunnelCfg.token) }
+          });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/settings") {
+          const body = JSON.parse(await readBody(req));
+          const patch = {};
+          if (typeof body.directEnabled === "boolean") patch.directEnabled = body.directEnabled;
+          if (typeof body.advertiseLan === "boolean") patch.advertiseLan = body.advertiseLan;
+          if (typeof body.publicUrl === "string") patch.publicUrl = body.publicUrl.trim();
+          if (Object.keys(patch).length) {
+            saveSettings(bridgeRoot, patch);
+            recordLog("设置更新", Object.keys(patch).join(", "));
+          }
+          sendJson(req, res, 200, { ok: true });
           return;
         }
 
@@ -368,8 +567,10 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
-    if (!isAuthorized(req)) {
-      sendJson(req, res, 401, { error: "Unauthorized" }, { "WWW-Authenticate": 'Bearer realm="astra-gemini"' });
+    if (!isClientAuthorized(req)) {
+      sendJson(req, res, 401, { error: "Unauthorized" }, {
+        "WWW-Authenticate": `Bearer resource_metadata="${getIssuer(req)}/.well-known/oauth-protected-resource/mcp"`
+      });
       return;
     }
 
@@ -466,7 +667,14 @@ export function createBridgeServer(options = {}) {
   serverRef = server;
 
   server.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    let url;
+    try {
+      url = new URL(req.url || "/", "http://localhost");
+    } catch {
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     if (url.pathname === "/ws/direct") {
       tree.handleDirectUpgrade(req, socket, head);
       return;
@@ -476,7 +684,11 @@ export function createBridgeServer(options = {}) {
       socket.destroy();
       return;
     }
-    if (!isAuthorized(req)) {
+    if (!isJoinAuthorized(req)) {
+      if (!joinToken && authMode !== "none" && !warnedNoJoinToken) {
+        warnedNoJoinToken = true;
+        recordLog("入网关闭", "未配置 ASTRA_JOIN_TOKEN，/ws/tree 已拒绝全部连接");
+      }
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;

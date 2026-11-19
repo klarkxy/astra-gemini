@@ -15,15 +15,20 @@ if (-not $createdNew) {
   exit 0
 }
 
-$tokenFile = Join-Path $Root "token.txt"
-if (-not (Test-Path $tokenFile)) {
-  $bytes = New-Object byte[] 32
-  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-  $token = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
-  Set-Content -Path $tokenFile -Value $token -Encoding ASCII -NoNewline
-} else {
-  $token = (Get-Content -Path $tokenFile -Raw).Trim()
+function Get-OrCreateToken([string]$fileName) {
+  $file = Join-Path $Root $fileName
+  if (-not (Test-Path $file)) {
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $t = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+    Set-Content -Path $file -Value $t -Encoding ASCII -NoNewline
+    return $t
+  }
+  return (Get-Content -Path $file -Raw).Trim()
 }
+
+$token = Get-OrCreateToken "token.txt"
+$joinToken = Get-OrCreateToken "join-token.txt"
 
 $projectsFile = Join-Path $Root "projects.json"
 if (-not (Test-Path $projectsFile)) {
@@ -67,6 +72,7 @@ function Start-Bridge {
   $psi.EnvironmentVariables["PORT"] = "$Port"
   $psi.EnvironmentVariables["AUTH_MODE"] = "bearer"
   $psi.EnvironmentVariables["ASTRA_TOKEN"] = $token
+  $psi.EnvironmentVariables["ASTRA_JOIN_TOKEN"] = $joinToken
   $script:nodeProc = [System.Diagnostics.Process]::Start($psi)
   Update-TrayUi
 }
@@ -86,6 +92,7 @@ $itemToggle = $menu.Items.Add("停止服务")
 $menu.Items.Add("-") | Out-Null
 $itemCopyUrl = $menu.Items.Add("复制本机 MCP 地址")
 $itemCopyToken = $menu.Items.Add("复制 Bearer Token")
+$itemCopyJoin = $menu.Items.Add("复制入网 Token")
 $itemOpenDir = $menu.Items.Add("打开程序目录")
 $menu.Items.Add("-") | Out-Null
 $itemExit = $menu.Items.Add("退出 Astra Gemini")
@@ -108,6 +115,10 @@ $itemCopyUrl.Add_Click({
 $itemCopyToken.Add_Click({
   [System.Windows.Forms.Clipboard]::SetText($token)
   $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制 Bearer Token", [System.Windows.Forms.ToolTipIcon]::Info)
+})
+$itemCopyJoin.Add_Click({
+  [System.Windows.Forms.Clipboard]::SetText($joinToken)
+  $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制入网 Token（子节点 wss://<公网地址>/ws/tree 使用）", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $itemOpenDir.Add_Click({ Start-Process explorer.exe $Root })
 $itemExit.Add_Click({

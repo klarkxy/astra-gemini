@@ -33,8 +33,8 @@ function buildSafeEnv() {
   return env;
 }
 
-function runWorker(payload, { cwd, timeoutMs = 30_000 }) {
-  const clampedTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 30_000, 120_000));
+function runWorker(payload, { cwd, timeoutMs = 30_000, timeoutCapMs = 120_000 }) {
+  const clampedTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 30_000, timeoutCapMs));
 
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [WORKER_PATH], {
@@ -116,6 +116,7 @@ export async function execVerify(bridgeRoot, projectCfg, opts = {}) {
     throw new Error("Missing required parameter: script (JavaScript code string).");
   }
   const settings = loadSettings(bridgeRoot);
+  const clampedTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 30_000, 120_000));
   return runWorker(
     {
       action: "exec",
@@ -123,8 +124,9 @@ export async function execVerify(bridgeRoot, projectCfg, opts = {}) {
       projectCfg,
       globalSdkEnabled: settings.globalSdkEnabled,
       script,
-      maxOutputBytes
+      maxOutputBytes,
+      timeoutMs: clampedTimeout
     },
-    { cwd: projectCfg.root, timeoutMs }
+    { cwd: projectCfg.root, timeoutMs: clampedTimeout + 5_000, timeoutCapMs: 125_000 }
   );
 }

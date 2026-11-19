@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,10 +12,18 @@ export const DEFAULT_SETTINGS = {
   nodeId: defaultNodeId(),
   port: 3939,
   authMode: "bearer",
+  publicUrl: "",
+  directEnabled: true,
+  advertiseLan: true,
   upstream: {
     enabled: false,
     url: "",
     token: ""
+  },
+  tunnel: {
+    mode: "quick",
+    token: "",
+    publicUrl: ""
   },
   globalSdkEnabled: {
     git: true,
@@ -31,36 +40,44 @@ export function getSettingsPath(bridgeRoot) {
   return path.join(path.resolve(bridgeRoot), "settings.json");
 }
 
+function mergedDefaults() {
+  return {
+    ...DEFAULT_SETTINGS,
+    upstream: { ...DEFAULT_SETTINGS.upstream },
+    tunnel: { ...DEFAULT_SETTINGS.tunnel },
+    globalSdkEnabled: { ...DEFAULT_SETTINGS.globalSdkEnabled }
+  };
+}
+
 export function loadSettings(bridgeRoot) {
   const filePath = getSettingsPath(bridgeRoot);
-  if (!fs.existsSync(filePath)) {
-    return {
-      ...DEFAULT_SETTINGS,
-      upstream: { ...DEFAULT_SETTINGS.upstream },
-      globalSdkEnabled: { ...DEFAULT_SETTINGS.globalSdkEnabled }
-    };
+  let merged = mergedDefaults();
+  if (fs.existsSync(filePath)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      merged = {
+        ...mergedDefaults(),
+        ...raw,
+        upstream: { ...DEFAULT_SETTINGS.upstream, ...(raw.upstream || {}) },
+        tunnel: { ...DEFAULT_SETTINGS.tunnel, ...(raw.tunnel || {}) },
+        globalSdkEnabled: {
+          ...DEFAULT_SETTINGS.globalSdkEnabled,
+          ...(raw.globalSdkEnabled || {})
+        }
+      };
+    } catch {
+      merged = mergedDefaults();
+    }
   }
-  try {
-    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return {
-      ...DEFAULT_SETTINGS,
-      ...raw,
-      upstream: {
-        ...DEFAULT_SETTINGS.upstream,
-        ...(raw.upstream || {})
-      },
-      globalSdkEnabled: {
-        ...DEFAULT_SETTINGS.globalSdkEnabled,
-        ...(raw.globalSdkEnabled || {})
-      }
-    };
-  } catch {
-    return {
-      ...DEFAULT_SETTINGS,
-      upstream: { ...DEFAULT_SETTINGS.upstream },
-      globalSdkEnabled: { ...DEFAULT_SETTINGS.globalSdkEnabled }
-    };
+  if (typeof merged.nodeSecret !== "string" || !/^[0-9a-f]{64}$/i.test(merged.nodeSecret)) {
+    merged.nodeSecret = crypto.randomBytes(32).toString("hex");
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(merged, null, 2) + "\n", "utf8");
+    } catch {
+      // ignore
+    }
   }
+  return merged;
 }
 
 export function saveSettings(bridgeRoot, nextSettings) {
@@ -71,6 +88,10 @@ export function saveSettings(bridgeRoot, nextSettings) {
     upstream: {
       ...current.upstream,
       ...(nextSettings.upstream || {})
+    },
+    tunnel: {
+      ...current.tunnel,
+      ...(nextSettings.tunnel || {})
     },
     globalSdkEnabled: {
       ...current.globalSdkEnabled,

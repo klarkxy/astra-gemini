@@ -9,7 +9,7 @@ import zlib from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBridgeServer } from "../src/server.mjs";
-import { connectWebSocket } from "../src/ws.mjs";
+import { acceptWebSocketUpgrade, connectWebSocket } from "../src/ws.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -159,16 +159,16 @@ test("Astra Gemini single-node: GUI firewall, SDK hot toggles, 7 dev SDKs, snaps
       arguments: {
         project: "demo",
         script: `
-          const br = sdk.git.branches();
-          const npmRes = sdk.npm.run("test");
-          const pyCheck = sdk.python.compileCheck("sample.py");
+          const br = await sdk.git.branches();
+          const npmRes = await sdk.npm.run("test");
+          const pyCheck = await sdk.python.compileCheck("sample.py");
           const localHealth = await sdk.http.request("http://127.0.0.1:${port}/health");
           let ssrfBlocked = false;
           try { await sdk.http.request("https://example.com"); } catch { ssrfBlocked = true; }
-          const grepHit = sdk.fs_read.grep("answer = 42");
-          const envBlocked = sdk.fs_read.tail(".env").ok === false;
-          const wt = sdk.worktree.create("iso1");
-          const wtRm = sdk.worktree.remove("iso1");
+          const grepHit = await sdk.fs_read.grep("answer = 42");
+          const envBlocked = (await sdk.fs_read.tail(".env")).ok === false;
+          const wt = await sdk.worktree.create("iso1");
+          const wtRm = await sdk.worktree.remove("iso1");
           return { ok: br.ok && npmRes.ok && pyCheck.ok && localHealth.ok && ssrfBlocked && grepHit.count === 1 && envBlocked && wt.ok && wtRm.ok };
         `
       }
@@ -267,6 +267,90 @@ test("Astra Gemini integrity & traffic: knownHashes (SHA-256/MD5), deleted, bund
   }
 });
 
+test("Astra Gemini exec_verify sandbox: permission model blocks escapes, sdk calls still work", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-sandbox-"));
+  const demoRepo = path.join(tmpBase, "demo-repo");
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge-root");
+  initTempGitRepo(demoRepo);
+
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(
+    projectsConfig,
+    JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }),
+    "utf8"
+  );
+
+  const token = "sandbox-tok";
+  const server = createBridgeServer({ bridgeRoot: bridgeState, projectsConfigPath: projectsConfig, nodeId: "sb", authMode: "bearer", authToken: token });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const outsideFile = path.join(REPO_ROOT, "package.json");
+
+  try {
+    const fsEscape = (await rpc(baseUrl, token, "tools/call", {
+      name: "exec_verify",
+      arguments: {
+        project: "demo",
+        script: `
+          const p = setTimeout.constructor("return process")();
+          try { p.getBuiltinModule("fs").readFileSync(${JSON.stringify(outsideFile)}); return "fs-open"; }
+          catch (e) { return e.code || e.name; }
+        `
+      }
+    })).body.result.structuredContent;
+    assert.equal(fsEscape.ok, true, fsEscape.error);
+    assert.equal(fsEscape.result, "ERR_ACCESS_DENIED");
+
+    const spawnEscape = (await rpc(baseUrl, token, "tools/call", {
+      name: "exec_verify",
+      arguments: {
+        project: "demo",
+        script: `
+          const p = sdk.git.branches.constructor("return process")();
+          try { p.getBuiltinModule("child_process").execSync("echo hi"); return "spawned"; }
+          catch (e) { return e.code || e.name; }
+        `
+      }
+    })).body.result.structuredContent;
+    assert.equal(spawnEscape.ok, true, spawnEscape.error);
+    assert.equal(spawnEscape.result, "ERR_ACCESS_DENIED");
+
+    const vmEscape = (await rpc(baseUrl, token, "tools/call", {
+      name: "exec_verify",
+      arguments: {
+        project: "demo",
+        script: `
+          try { const p = Object.constructor("return process")(); return typeof p; }
+          catch (e) { return e.name; }
+        `
+      }
+    })).body.result.structuredContent;
+    assert.equal(vmEscape.ok, true, vmEscape.error);
+    assert.equal(vmEscape.result, "ReferenceError");
+
+    const sdkOk = (await rpc(baseUrl, token, "tools/call", {
+      name: "exec_verify",
+      arguments: {
+        project: "demo",
+        script: `
+          const st = await sdk.git.status();
+          let badCall = "";
+          try { await sdk.git.nonexistent(); } catch (e) { badCall = e.constructor.name; }
+          return { statusOk: st.ok, badCall };
+        `
+      }
+    })).body.result.structuredContent;
+    assert.equal(sdkOk.ok, true, sdkOk.error);
+    assert.equal(sdkOk.result.statusOk, true);
+    assert.equal(sdkOk.result.badCall, "TypeError");
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
 test("Astra Gemini 3-tier Direct-First Tunnel Upgrade (>10KB WS gzip payload) + Ticket Security", async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-direct-"));
   const leafRepo = path.join(tmpBase, "leaf-repo");
@@ -284,7 +368,7 @@ test("Astra Gemini 3-tier Direct-First Tunnel Upgrade (>10KB WS gzip payload) + 
     "utf8"
   );
 
-  const rootServer = createBridgeServer({ bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "r-tok" });
+  const rootServer = createBridgeServer({ bridgeRoot: rootDir, nodeId: "root", authMode: "bearer", authToken: "r-tok", joinToken: "r-join" });
   await new Promise((r) => rootServer.listen(0, "127.0.0.1", r));
   const rootPort = rootServer.address().port;
   const rootUrl = `http://127.0.0.1:${rootPort}`;
@@ -294,7 +378,8 @@ test("Astra Gemini 3-tier Direct-First Tunnel Upgrade (>10KB WS gzip payload) + 
     nodeId: "branch",
     authMode: "bearer",
     authToken: "b-tok",
-    upstream: { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "r-tok" }
+    joinToken: "b-join",
+    upstream: { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "r-join" }
   });
   await new Promise((r) => branchServer.listen(0, "127.0.0.1", r));
   const branchPort = branchServer.address().port;
@@ -305,8 +390,9 @@ test("Astra Gemini 3-tier Direct-First Tunnel Upgrade (>10KB WS gzip payload) + 
     nodeId: "leaf",
     authMode: "bearer",
     authToken: "l-tok",
+    joinToken: "l-join",
     directCandidates: leafCandidates,
-    upstream: { enabled: true, url: `ws://127.0.0.1:${branchPort}/ws/tree`, token: "b-tok" }
+    upstream: { enabled: true, url: `ws://127.0.0.1:${branchPort}/ws/tree`, token: "b-join" }
   });
   await new Promise((r) => leafServer.listen(0, "127.0.0.1", r));
   const leafPort = leafServer.address().port;
@@ -365,6 +451,7 @@ test("Astra Gemini 3-tier Automatic Relay Fallback when Direct Tunnel candidates
     nodeId: "root",
     authMode: "bearer",
     authToken: "r-tok",
+    joinToken: "r-join",
     directTimeoutMs: 400
   });
   await new Promise((r) => rootServer.listen(0, "127.0.0.1", r));
@@ -376,7 +463,8 @@ test("Astra Gemini 3-tier Automatic Relay Fallback when Direct Tunnel candidates
     nodeId: "branch",
     authMode: "bearer",
     authToken: "b-tok",
-    upstream: { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "r-tok" }
+    joinToken: "b-join",
+    upstream: { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "r-join" }
   });
   await new Promise((r) => branchServer.listen(0, "127.0.0.1", r));
   const branchPort = branchServer.address().port;
@@ -386,8 +474,9 @@ test("Astra Gemini 3-tier Automatic Relay Fallback when Direct Tunnel candidates
     nodeId: "leaf",
     authMode: "bearer",
     authToken: "l-tok",
+    joinToken: "l-join",
     directCandidates: ["ws://127.0.0.1:1/ws/direct"],
-    upstream: { enabled: true, url: `ws://127.0.0.1:${branchPort}/ws/tree`, token: "b-tok" }
+    upstream: { enabled: true, url: `ws://127.0.0.1:${branchPort}/ws/tree`, token: "b-join" }
   });
   await new Promise((r) => leafServer.listen(0, "127.0.0.1", r));
 
@@ -412,6 +501,560 @@ test("Astra Gemini 3-tier Automatic Relay Fallback when Direct Tunnel candidates
     leafServer.close();
     branchServer.close();
     rootServer.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini token split: join token vs client token isolation", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-tokens-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "n1",
+    authMode: "bearer",
+    authToken: "client-tok",
+    joinToken: "join-tok"
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+
+  try {
+    const mcpRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer join-tok" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+    });
+    assert.equal(mcpRes.status, 401);
+    const wwwAuth = mcpRes.headers.get("www-authenticate") || "";
+    assert.match(wwwAuth, new RegExp(`resource_metadata="http://127\.0\.0\.1:${port}/\.well-known/oauth-protected-resource/mcp"`));
+
+    await assert.rejects(
+      () => connectWebSocket(`ws://127.0.0.1:${port}/ws/tree`, { headers: { Authorization: "Bearer client-tok" } }),
+      /401/
+    );
+
+    const ws = await connectWebSocket(`ws://127.0.0.1:${port}/ws/tree`, {
+      headers: { Authorization: "Bearer join-tok" }
+    });
+    ws.close(1000);
+
+    const prRes = await new Promise((resolve, reject) => {
+      const r = http.request(
+        {
+          hostname: "127.0.0.1",
+          port,
+          path: "/.well-known/oauth-protected-resource/mcp",
+          headers: { Host: "example.test", "x-forwarded-proto": "https" }
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
+        }
+      );
+      r.on("error", reject);
+      r.end();
+    });
+    assert.equal(prRes.resource, "https://example.test/mcp");
+    assert.deepEqual(prRes.authorization_servers, ["https://example.test"]);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini nodeId TOFU binding: hijack rejected, admin reset allows re-bind", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-tofu-"));
+  const kidRepo = path.join(tmpBase, "kid-repo");
+  initTempGitRepo(kidRepo);
+  const parentDir = makeTempBridgeRoot(tmpBase, "parent");
+  const childDir = makeTempBridgeRoot(tmpBase, "child");
+  fs.writeFileSync(path.join(parentDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(
+    path.join(childDir, "projects.json"),
+    JSON.stringify({ "kid-app": { root: kidRepo, mode: "direct", sdks: ["git"] } }),
+    "utf8"
+  );
+
+  const parent = createBridgeServer({
+    bridgeRoot: parentDir,
+    nodeId: "parent",
+    authMode: "bearer",
+    authToken: "p-tok",
+    joinToken: "p-join"
+  });
+  await new Promise((r) => parent.listen(0, "127.0.0.1", r));
+  const parentPort = parent.address().port;
+  const parentUrl = `http://127.0.0.1:${parentPort}`;
+
+  const child = createBridgeServer({
+    bridgeRoot: childDir,
+    nodeId: "kid",
+    authMode: "bearer",
+    authToken: "k-tok",
+    joinToken: "k-join",
+    upstream: { enabled: true, url: `ws://127.0.0.1:${parentPort}/ws/tree`, token: "p-join" }
+  });
+  await new Promise((r) => child.listen(0, "127.0.0.1", r));
+
+  const kidOnline = () =>
+    (parent.tree.getTreeStatus().children || []).some((c) => c.nodeId === "kid" && c.online);
+
+  try {
+    assert.equal(await waitUntil(kidOnline), true);
+
+    const evil = await connectWebSocket(`ws://127.0.0.1:${parentPort}/ws/tree`, {
+      headers: { Authorization: "Bearer p-join" }
+    });
+    const closeCode = await new Promise((resolve) => {
+      evil.on("close", (code) => resolve(code));
+      evil.sendJson({ type: "node/register", nodeId: "kid", nodeSecret: "f".repeat(64), projects: [] });
+    });
+    assert.equal(closeCode, 1008);
+    assert.equal(kidOnline(), true);
+
+    const snap = (await rpc(parentUrl, "p-tok", "tools/call", {
+      name: "pull_snapshot",
+      arguments: { project: "kid/kid-app" }
+    })).body.result.structuredContent;
+    assert.ok(snap.files.some((f) => f.path === "app.js"));
+
+    const del = await fetch(`${parentUrl}/api/tree/children/kid`, { method: "DELETE" }).then((r) => r.json());
+    assert.equal(del.ok, true);
+    assert.equal(await waitUntil(kidOnline, 6000), true);
+  } finally {
+    child.close();
+    parent.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini OAuth 2.1: DCR, authorize, PKCE, refresh rotation, persistence", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-oauth-"));
+  const demoRepo = path.join(tmpBase, "demo-repo");
+  initTempGitRepo(demoRepo);
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const clientToken = "oauth-client-tok";
+  const makeServer = () =>
+    createBridgeServer({
+      bridgeRoot: bridgeState,
+      projectsConfigPath: projectsConfig,
+      nodeId: "o",
+      authMode: "bearer",
+      authToken: clientToken,
+      joinToken: "j"
+    });
+
+  const server = makeServer();
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  const base = `http://127.0.0.1:${port}`;
+  let accessToken;
+
+  try {
+    const pr = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`).then((r) => r.json());
+    assert.equal(pr.resource, `${base}/mcp`);
+    assert.deepEqual(pr.authorization_servers, [base]);
+
+    const as = await fetch(`${base}/.well-known/oauth-authorization-server`).then((r) => r.json());
+    assert.equal(as.issuer, base);
+    assert.equal(as.token_endpoint, `${base}/oauth/token`);
+    assert.equal(as.registration_endpoint, `${base}/oauth/register`);
+
+    const badReg = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["http://evil.example.com/cb"] })
+    });
+    assert.equal(badReg.status, 400);
+    assert.equal((await badReg.json()).error, "invalid_redirect_uri");
+
+    const redirectUri = "https://claude.ai/api/mcp/auth_callback";
+    const reg = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Claude",
+        redirect_uris: [redirectUri],
+        token_endpoint_auth_method: "none"
+      })
+    });
+    assert.equal(reg.status, 201);
+    const client = await reg.json();
+    assert.ok(client.client_id);
+    assert.ok(!client.client_secret);
+    assert.equal(client.token_endpoint_auth_method, "none");
+
+    const verifier = `v-${crypto.randomBytes(32).toString("base64url")}`;
+    const challenge = crypto.createHash("sha256").update(verifier, "utf8").digest("base64url");
+    const authParams = {
+      client_id: client.client_id,
+      response_type: "code",
+      redirect_uri: redirectUri,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "st-123",
+      resource: `${base}/mcp`
+    };
+
+    const badAuth = await fetch(
+      `${base}/oauth/authorize?` +
+        new URLSearchParams({ ...authParams, redirect_uri: "https://claude.ai/other_cb" }),
+      { redirect: "manual" }
+    );
+    assert.equal(badAuth.status, 400);
+    assert.equal(badAuth.headers.get("location"), null);
+
+    const getAuth = await fetch(`${base}/oauth/authorize?` + new URLSearchParams(authParams), {
+      redirect: "manual"
+    });
+    assert.equal(getAuth.status, 200);
+    const html = await getAuth.text();
+    assert.match(html, /访问口令/);
+    assert.equal(getAuth.headers.get("x-frame-options"), "DENY");
+
+    const postForm = (body) =>
+      fetch(`${base}/oauth/authorize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body),
+        redirect: "manual"
+      });
+
+    const wrongPw = await postForm({ ...authParams, password: "wrong-token" });
+    assert.equal(wrongPw.status, 401);
+    assert.equal(wrongPw.headers.get("location"), null);
+
+    const rightPw = await postForm({ ...authParams, password: clientToken });
+    assert.equal(rightPw.status, 302);
+    const loc = new URL(rightPw.headers.get("location"));
+    assert.equal(loc.origin + loc.pathname, redirectUri);
+    assert.equal(loc.searchParams.get("state"), "st-123");
+    const code = loc.searchParams.get("code");
+    assert.ok(code);
+
+    const postToken = (body) =>
+      fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(body)
+      });
+
+    const badTok = await postToken({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: "wrong-verifier"
+    });
+    assert.equal(badTok.status, 400);
+    assert.equal((await badTok.json()).error, "invalid_grant");
+
+    const tok = await postToken({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier
+    });
+    assert.equal(tok.status, 200);
+    const tokens = await tok.json();
+    assert.equal(tokens.token_type, "Bearer");
+    assert.equal(tokens.expires_in, 3600);
+    assert.ok(tokens.access_token && tokens.refresh_token);
+
+    const reuse = await postToken({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier
+    });
+    assert.equal((await reuse.json()).error, "invalid_grant");
+
+    const mcpRes = await rpc(base, tokens.access_token, "tools/list");
+    assert.equal(mcpRes.status, 200);
+    assert.ok(mcpRes.body.result.tools.length >= 5);
+
+    const ref1 = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: tokens.refresh_token
+    });
+    assert.equal(ref1.status, 200);
+    const tokens2 = await ref1.json();
+    assert.notEqual(tokens2.access_token, tokens.access_token);
+    assert.ok(tokens2.refresh_token);
+
+    const refOld = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: tokens.refresh_token
+    });
+    assert.equal((await refOld.json()).error, "invalid_grant");
+
+    accessToken = tokens2.access_token;
+  } finally {
+    server.close();
+  }
+
+  const server2 = makeServer();
+  await new Promise((r) => server2.listen(0, "127.0.0.1", r));
+  try {
+    const persisted = await rpc(`http://127.0.0.1:${server2.address().port}`, accessToken, "tools/list");
+    assert.equal(persisted.status, 200);
+    assert.ok(persisted.body.result.tools.length >= 5);
+  } finally {
+    server2.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini keepalive: parent sweeps dead children, child reconnects on silent upstream", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-keepalive-"));
+  const parentDir = makeTempBridgeRoot(tmpBase, "parent");
+  const leafDir = makeTempBridgeRoot(tmpBase, "leaf");
+  fs.writeFileSync(path.join(parentDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(leafDir, "projects.json"), "{}", "utf8");
+
+  const parent = createBridgeServer({
+    bridgeRoot: parentDir,
+    nodeId: "p",
+    authMode: "bearer",
+    authToken: "t",
+    joinToken: "j",
+    heartbeatIntervalMs: 200
+  });
+  await new Promise((r) => parent.listen(0, "127.0.0.1", r));
+  const parentPort = parent.address().port;
+
+  const silentSockets = [];
+  const silent = http.createServer((req, res) => {
+    res.writeHead(404);
+    res.end();
+  });
+  silent.on("upgrade", (req, socket, head) => {
+    const w = acceptWebSocketUpgrade(req, socket, head);
+    if (!w) return;
+    silentSockets.push(w);
+    w.on("message", () => {});
+    w.on("close", () => {});
+    w.on("error", () => {});
+  });
+  await new Promise((r) => silent.listen(0, "127.0.0.1", r));
+  const silentPort = silent.address().port;
+
+  const leaf = createBridgeServer({
+    bridgeRoot: leafDir,
+    nodeId: "leaf",
+    authMode: "bearer",
+    authToken: "lt",
+    joinToken: "lj",
+    heartbeatIntervalMs: 200,
+    upstream: { enabled: true, url: `ws://127.0.0.1:${silentPort}/ws/tree`, token: "x" }
+  });
+  await new Promise((r) => leaf.listen(0, "127.0.0.1", r));
+
+  try {
+    const ghost = await connectWebSocket(`ws://127.0.0.1:${parentPort}/ws/tree`, {
+      headers: { Authorization: "Bearer j" }
+    });
+    ghost.sendJson({ type: "node/register", nodeId: "ghost", nodeSecret: "a".repeat(64), projects: [] });
+    const ghostOnline = () =>
+      (parent.tree.getTreeStatus().children || []).some((c) => c.nodeId === "ghost" && c.online);
+    assert.equal(await waitUntil(ghostOnline), true);
+
+    const ghostClosed = new Promise((resolve) => ghost.on("close", (code) => resolve(code)));
+    assert.equal(await Promise.race([ghostClosed, new Promise((r) => setTimeout(() => r(0), 3000))]), 1006);
+    const ghostGone = () =>
+      (parent.tree.getTreeStatus().children || []).some((c) => c.nodeId === "ghost" && !c.online);
+    assert.equal(await waitUntil(ghostGone), true);
+
+    assert.equal(await waitUntil(() => silentSockets.length >= 2, 8000), true);
+  } finally {
+    leaf.close();
+    silent.closeAllConnections?.();
+    silent.close();
+    parent.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini relay timeout: relayed exec_verify uses tool timeout + hop grace", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-relayto-"));
+  const leafRepo = path.join(tmpBase, "leaf-repo");
+  initTempGitRepo(leafRepo);
+
+  const rootDir = makeTempBridgeRoot(tmpBase, "root");
+  const branchDir = makeTempBridgeRoot(tmpBase, "branch");
+  const leafDir = makeTempBridgeRoot(tmpBase, "leaf");
+
+  fs.writeFileSync(path.join(rootDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(branchDir, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(
+    path.join(leafDir, "projects.json"),
+    JSON.stringify({ "leaf-app": { root: leafRepo, mode: "direct", sdks: ["git"] } }, null, 2),
+    "utf8"
+  );
+
+  const rootServer = createBridgeServer({
+    bridgeRoot: rootDir,
+    nodeId: "root",
+    authMode: "bearer",
+    authToken: "r-tok",
+    joinToken: "r-join",
+    relayBaseTimeoutMs: 500,
+    directEnabled: false
+  });
+  await new Promise((r) => rootServer.listen(0, "127.0.0.1", r));
+  const rootPort = rootServer.address().port;
+  const rootUrl = `http://127.0.0.1:${rootPort}`;
+
+  const branchServer = createBridgeServer({
+    bridgeRoot: branchDir,
+    nodeId: "branch",
+    authMode: "bearer",
+    authToken: "b-tok",
+    joinToken: "b-join",
+    upstream: { enabled: true, url: `ws://127.0.0.1:${rootPort}/ws/tree`, token: "r-join" }
+  });
+  await new Promise((r) => branchServer.listen(0, "127.0.0.1", r));
+  const branchPort = branchServer.address().port;
+
+  const leafServer = createBridgeServer({
+    bridgeRoot: leafDir,
+    nodeId: "leaf",
+    authMode: "bearer",
+    authToken: "l-tok",
+    joinToken: "l-join",
+    upstream: { enabled: true, url: `ws://127.0.0.1:${branchPort}/ws/tree`, token: "b-join" }
+  });
+  await new Promise((r) => leafServer.listen(0, "127.0.0.1", r));
+
+  try {
+    const propagated = await waitUntil(async () => {
+      const res = await rpc(rootUrl, "r-tok", "tools/call", { name: "list_projects", arguments: {} });
+      return (res.body.result.structuredContent || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
+    });
+    assert.equal(propagated, true);
+
+    const res = (await rpc(rootUrl, "r-tok", "tools/call", {
+      name: "exec_verify",
+      arguments: {
+        project: "branch/leaf/leaf-app",
+        timeoutMs: 5000,
+        script: `await new Promise((r) => setTimeout(r, 1500)); return "ok-slept";`
+      }
+    })).body.result.structuredContent;
+    assert.equal(res.ok, true, res.error);
+    assert.equal(res.result, "ok-slept");
+    assert.ok(rootServer.tree.getTreeStatus().directStats.relayCalls >= 1);
+  } finally {
+    leafServer.close();
+    branchServer.close();
+    rootServer.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+test("Astra Gemini OAuth: register rate limit + eviction protects tokened clients", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-dcr-"));
+  const demoRepo = path.join(tmpBase, "demo-repo");
+  initTempGitRepo(demoRepo);
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const clientToken = "dcr-tok";
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    projectsConfigPath: projectsConfig,
+    nodeId: "dcr",
+    authMode: "bearer",
+    authToken: clientToken,
+    joinToken: "j",
+    oauthMaxClients: 3,
+    oauthRegisterLimit: 5
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  const base = `http://127.0.0.1:${port}`;
+
+  try {
+    const redirectUri = "https://claude.ai/api/mcp/auth_callback";
+    const regA = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_name: "Keeper", redirect_uris: [redirectUri], token_endpoint_auth_method: "none" })
+    });
+    assert.equal(regA.status, 201);
+    const clientA = (await regA.json()).client_id;
+
+    const verifier = "v-" + crypto.randomBytes(32).toString("base64url");
+    const challenge = crypto.createHash("sha256").update(verifier, "utf8").digest("base64url");
+    const authParams = {
+      client_id: clientA,
+      response_type: "code",
+      redirect_uri: redirectUri,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      resource: `${base}/mcp`
+    };
+    const authRes = await fetch(`${base}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ ...authParams, password: clientToken }),
+      redirect: "manual"
+    });
+    assert.equal(authRes.status, 302);
+    const code = new URL(authRes.headers.get("location")).searchParams.get("code");
+    const tokRes = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: clientA,
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: verifier
+      })
+    });
+    assert.equal(tokRes.status, 200);
+    const tokens = await tokRes.json();
+    assert.ok(tokens.refresh_token);
+
+    const statuses = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await fetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_name: `spam${i}`, redirect_uris: [`https://spam${i}.example.com/cb`] })
+      });
+      statuses.push(r.status);
+    }
+    assert.deepEqual(statuses, [201, 201, 201, 201, 429]);
+
+    const list = await fetch(`${base}/api/oauth`).then((r) => r.json());
+    assert.equal(list.clients.length, 3);
+    assert.ok(list.clients.some((c) => c.client_id === clientA));
+
+    const ref = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: clientA,
+        refresh_token: tokens.refresh_token
+      })
+    });
+    assert.equal(ref.status, 200);
+    assert.ok((await ref.json()).access_token);
+  } finally {
+    server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });

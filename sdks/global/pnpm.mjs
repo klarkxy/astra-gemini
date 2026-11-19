@@ -37,7 +37,7 @@ export function createSdk({ project }) {
     Array.isArray(project.allowedScripts) && project.allowedScripts.length > 0
       ? project.allowedScripts
       : DEFAULT_ALLOWED_SCRIPTS;
-  const pnpmBin = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+  const pnpmBin = "pnpm";
 
   return {
     listScripts() {
@@ -55,6 +55,7 @@ export function createSdk({ project }) {
       const res = spawnSync(pnpmBin, ["list", "-r", "--depth", "-1", "--json"], {
         cwd: project.root,
         encoding: "utf8",
+        shell: process.platform === "win32",
         maxBuffer: 5 * 1024 * 1024
       });
       if (res.error) return { ok: false, error: `pnpm 未安装或不可用: ${res.error.message}` };
@@ -91,6 +92,7 @@ export function createSdk({ project }) {
       const res = spawnSync(pnpmBin, args, {
         cwd: project.root,
         encoding: "utf8",
+        shell: process.platform === "win32",
         maxBuffer: 10 * 1024 * 1024
       });
       if (res.error) return { ok: false, error: `pnpm 启动失败: ${res.error.message}` };

@@ -193,7 +193,7 @@ export function applyPatch(bridgeRoot, projectCfg, opts = {}) {
     }
   }
 
-  const check = spawnSync("git", ["apply", "--check", "--whitespace=nowarn", "-"], {
+  const check = spawnSync("git", ["-c", "core.autocrlf=false", "apply", "--check", "--whitespace=nowarn", "-"], {
     cwd: projectCfg.root,
     input: patch,
     encoding: "utf8"
@@ -213,7 +213,7 @@ export function applyPatch(bridgeRoot, projectCfg, opts = {}) {
 
   const backupId = createBackup(bridgeRoot, projectCfg, touchedPaths);
 
-  const applied = spawnSync("git", ["apply", "--whitespace=nowarn", "-"], {
+  const applied = spawnSync("git", ["-c", "core.autocrlf=false", "apply", "--whitespace=nowarn", "-"], {
     cwd: projectCfg.root,
     input: patch,
     encoding: "utf8"

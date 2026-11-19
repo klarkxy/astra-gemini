@@ -165,11 +165,20 @@
         </div>
       </div>
       <div>
-        <div class="kv-label">公网临时隧道（Cloudflare Tunnel）</div>
+        <div class="kv-label">公网隧道（Cloudflare Tunnel）</div>
         <div class="kv-row">
           <code class="box" id="tunnelUrl">未启动</code>
           <button class="sm primary" id="tunnelBtn" onclick="toggleTunnel()">一键启动</button>
           <button class="sm" id="copyTunnelBtn" style="display:none;" onclick="copyText(state.tunnel.mcpUrl, '已复制公网 MCP 地址')">复制</button>
+        </div>
+        <div class="kv-row" style="margin-top:8px;flex-wrap:wrap;">
+          <select id="tnMode">
+            <option value="quick">临时隧道（随机域名）</option>
+            <option value="named">命名隧道（固定域名）</option>
+          </select>
+          <input type="password" id="tnToken" placeholder="Tunnel Token（命名隧道）" style="flex:1;min-width:130px;" />
+          <input type="text" id="tnPublicUrl" placeholder="固定域名 https://..." style="flex:1;min-width:150px;" />
+          <button class="sm" onclick="saveTunnelConfig()">保存</button>
         </div>
       </div>
     </section>
@@ -230,8 +239,8 @@
           <label class="field">上游父节点 WS 地址
             <input type="text" id="tUpUrl" placeholder="例如 wss://parent.example.com/ws/tree" />
           </label>
-          <label class="field">上游父节点 Token
-            <input type="password" id="tUpToken" placeholder="粘贴父节点的 Bearer Token" />
+          <label class="field">上游父节点入网 Token
+            <input type="password" id="tUpToken" placeholder="粘贴父节点的 join-token" />
           </label>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
@@ -242,11 +251,35 @@
       </div>
 
       <div class="card" style="margin-bottom:16px;">
-        <div class="kv-label">让其他设备连入本机（将此地址与上方 Token 填进子节点的“上游父节点”即可）：</div>
+        <div class="kv-label">让其他设备连入本机（将此地址与下方入网 Token 填进子节点的“上游父节点”即可）：</div>
         <div class="kv-row">
           <code class="box" id="childJoinUrl">ws://127.0.0.1:3939/ws/tree</code>
           <button class="sm" onclick="copyText(document.getElementById('childJoinUrl').textContent, '已复制子节点接入地址')">复制</button>
         </div>
+        <div class="kv-row" style="margin-top:8px;">
+          <div class="kv-label" style="align-self:center;white-space:nowrap;">入网 Token</div>
+          <code class="box" id="joinTokenBox">••••••••</code>
+          <button class="sm" onclick="toggleJoinTokenMask()">显示</button>
+          <button class="sm" onclick="copyText(state.joinToken, '已复制入网 Token')">复制</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head"><strong>直连与广播设置</strong></div>
+        <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
+          <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+            <span class="switch"><input type="checkbox" id="swDirect" /><span class="slider"></span></span>
+            优先直连隧道（Direct-First）
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;">
+            <span class="switch"><input type="checkbox" id="swLan" /><span class="slider"></span></span>
+            广播局域网候选地址（advertiseLan）
+          </label>
+        </div>
+        <label class="field" style="margin-top:12px;">固定公网地址 publicUrl（可选，作为 OAuth issuer 与 MCP 公网入口）
+          <input type="text" id="sPublicUrl" placeholder="https://astra.example.com" />
+        </label>
+        <div><button class="sm primary" style="margin-top:10px;" onclick="saveToggles()">保存设置</button></div>
       </div>
 
       <div class="sub" id="directStatsText" style="margin-bottom:10px;"></div>
@@ -266,6 +299,13 @@
         </div>
         <div id="envGrid" style="display:flex;flex-wrap:wrap;gap:10px;"></div>
       </div>
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head">
+          <strong>已授权的 AI 客户端（OAuth）</strong>
+          <button class="sm danger" onclick="revokeAllOauth()">全部撤销</button>
+        </div>
+        <div id="oauthList"></div>
+      </div>
       <div class="card">
         <strong>最近运行日志</strong>
         <div id="logList"></div>
@@ -276,9 +316,11 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    let state = { sdks: [], projects: [], backups: [], logs: [], tunnel: {}, tree: {}, authToken: "", localMcpUrl: "", localWsUrl: "" };
+    let state = { sdks: [], projects: [], backups: [], logs: [], tunnel: {}, tree: {}, authToken: "", joinToken: "", localMcpUrl: "", localWsUrl: "", oauthClients: [] };
     let showToken = false;
+    let showJoinToken = false;
     let treeFormInitialized = false;
+    let settingsFormInitialized = false;
 
     function toast(msg) {
       const el = document.getElementById("toast");
@@ -309,6 +351,11 @@
       renderHeader();
     }
 
+    function toggleJoinTokenMask() {
+      showJoinToken = !showJoinToken;
+      renderTree();
+    }
+
     function renderHeader() {
       document.getElementById("uptimeText").textContent = `节点 ${state.tree?.nodeId || "-"} · 运行 ${state.uptimeSec || 0}s`;
       document.getElementById("localUrl").textContent = state.localMcpUrl || "";
@@ -317,6 +364,13 @@
         : (showToken ? state.authToken : "•".repeat(24));
 
       const t = state.tunnel || {};
+      if (state.settings?.tunnel) {
+        document.getElementById("tnMode").value = state.settings.tunnel.mode || "quick";
+        document.getElementById("tnPublicUrl").value = state.settings.tunnel.publicUrl || "";
+        document.getElementById("tnToken").placeholder = state.settings.tunnel.hasToken
+          ? "Token 已保存（粘贴新 Token 可覆盖）"
+          : "Tunnel Token（命名隧道）";
+      }
       const tUrlEl = document.getElementById("tunnelUrl");
       const tBtn = document.getElementById("tunnelBtn");
       const cBtn = document.getElementById("copyTunnelBtn");
@@ -405,6 +459,15 @@
         document.getElementById("tUpToken").value = state.settings.upstream?.token || "";
         treeFormInitialized = true;
       }
+      if (!settingsFormInitialized && state.settings) {
+        document.getElementById("swDirect").checked = state.settings.directEnabled !== false;
+        document.getElementById("swLan").checked = state.settings.advertiseLan !== false;
+        document.getElementById("sPublicUrl").value = state.settings.publicUrl || "";
+        settingsFormInitialized = true;
+      }
+      document.getElementById("joinTokenBox").textContent = showJoinToken
+        ? (state.joinToken || "未配置")
+        : "•".repeat(24);
       const badge = document.getElementById("upstreamBadge");
       const detail = document.getElementById("upstreamDetail");
       if (up.connected) {
@@ -421,8 +484,9 @@
         detail.textContent = "未配置上游父节点";
       }
 
-      const publicWs = state.tunnel?.publicUrl
-        ? state.tunnel.publicUrl.replace(/^https:\/\//i, "wss://") + "/ws/tree"
+      const publicBase = state.publicUrl || state.tunnel?.publicUrl || "";
+      const publicWs = publicBase && !/^http:\/\/(127\.0\.0\.1|localhost|\[?::1\]?)/i.test(publicBase)
+        ? publicBase.replace(/^http/i, "ws") + "/ws/tree"
         : state.localWsUrl;
       document.getElementById("childJoinUrl").textContent = publicWs || "ws://127.0.0.1:3939/ws/tree";
 
@@ -437,7 +501,7 @@
       }
       list.innerHTML = `
         <table>
-          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th></tr></thead>
+          <thead><tr><th>子节点名</th><th>状态</th><th>挂载项目（调用前缀：节点名/项目名）</th><th>上线时间</th><th>操作</th></tr></thead>
           <tbody>
             ${children.map((c) => `
               <tr>
@@ -445,6 +509,7 @@
                 <td><span class="tag ${c.online ? "ok" : "err"}">${c.online ? "在线" : "离线"}</span></td>
                 <td><code>${(c.projects || []).map((p) => c.nodeId + "/" + p).join(", ") || "(无)"}</code></td>
                 <td>${(c.connectedAt || "").replace("T", " ").slice(0, 19)}</td>
+                <td><button class="sm danger" onclick="removeChild('${c.nodeId}')">移除/重置</button></td>
               </tr>
             `).join("")}
           </tbody>
@@ -576,6 +641,91 @@
       setTimeout(refreshAll, 2500);
     }
 
+    async function saveTunnelConfig() {
+      const body = {
+        mode: document.getElementById("tnMode").value,
+        publicUrl: document.getElementById("tnPublicUrl").value.trim()
+      };
+      const tk = document.getElementById("tnToken").value.trim();
+      if (tk) body.token = tk;
+      const res = await fetch("/api/tunnel/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }).then((r) => r.json());
+      if (res.ok) {
+        document.getElementById("tnToken").value = "";
+        toast("隧道配置已保存");
+        refreshAll();
+      } else {
+        toast(res.error || "保存失败");
+      }
+    }
+
+    async function saveToggles() {
+      const res = await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          directEnabled: document.getElementById("swDirect").checked,
+          advertiseLan: document.getElementById("swLan").checked,
+          publicUrl: document.getElementById("sPublicUrl").value.trim()
+        })
+      }).then((r) => r.json());
+      toast(res.ok ? "设置已保存" : (res.error || "保存失败"));
+    }
+
+    async function removeChild(nodeId) {
+      if (!confirm(`确定移除并重置子节点 "${nodeId}" 的入网绑定？`)) return;
+      const res = await fetch(`/api/tree/children/${encodeURIComponent(nodeId)}`, { method: "DELETE" }).then((r) => r.json());
+      toast(res.ok ? `已移除 ${nodeId}` : (res.error || "移除失败"));
+      refreshAll();
+    }
+
+    function renderOauth() {
+      const box = document.getElementById("oauthList");
+      const clients = state.oauthClients || [];
+      if (!clients.length) {
+        box.innerHTML = '<div class="empty" style="padding:14px;">暂无已授权的 AI 客户端。Claude/ChatGPT 连接器完成 OAuth 登录后会出现在这里。</div>';
+        return;
+      }
+      box.innerHTML = `
+        <table>
+          <thead><tr><th>客户端</th><th>client_id</th><th>回调地址</th><th>注册时间</th><th>活跃令牌</th></tr></thead>
+          <tbody>
+            ${clients.map((c) => `
+              <tr>
+                <td><strong>${c.client_name || "(未命名)"}</strong></td>
+                <td><code>${c.client_id}</code></td>
+                <td><code>${(c.redirect_uris || []).join(", ")}</code></td>
+                <td>${new Date(c.created_at || 0).toLocaleString("zh-CN", { hour12: false })}</td>
+                <td>${c.activeTokens || 0}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    async function loadOauth() {
+      const res = await fetch("/api/oauth").then((r) => r.json()).catch(() => null);
+      if (res?.ok) {
+        state.oauthClients = res.clients || [];
+        renderOauth();
+      }
+    }
+
+    async function revokeAllOauth() {
+      if (!confirm("确定撤销全部 OAuth 访问令牌？所有已连接的 AI 客户端需要重新授权。")) return;
+      const res = await fetch("/api/oauth/revoke-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({})
+      }).then((r) => r.json());
+      toast(res.ok ? "已撤销全部令牌" : (res.error || "操作失败"));
+      loadOauth();
+    }
+
     async function loadEnv() {
       const res = await fetch("/api/env").then((r) => r.json());
       const box = document.getElementById("envGrid");
@@ -597,6 +747,7 @@
       renderTree();
       renderBackups();
       renderLogs();
+      loadOauth();
     }
 
     refreshAll();

@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== Astra Gemini (星空双子座) v0.1.0 一键初始化 ===" -ForegroundColor Cyan
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Error "未检测到 Node.js (>= 18)，请先安装 Node.js 后重试。"
+  Write-Error "未检测到 Node.js (>= 25)，请先安装 Node.js 后重试。"
 }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
   Write-Error "未检测到 Git for Windows，请先安装 Git 后重试。"
@@ -21,13 +21,15 @@ if (-not (Test-Path $projectsFile)) {
   Write-Host "已生成 projects.json（启动后可直接在网页控制台里可视化编辑）" -ForegroundColor Yellow
 }
 
-$tokenFile = Join-Path $root "token.txt"
-if (-not (Test-Path $tokenFile)) {
-  $bytes = New-Object byte[] 32
-  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-  $token = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
-  Set-Content -Path $tokenFile -Value $token -Encoding ASCII -NoNewline
-  Write-Host "已生成随机 Bearer Token 并保存到 token.txt" -ForegroundColor Green
+foreach ($name in @("token.txt", "join-token.txt")) {
+  $tokenFile = Join-Path $root $name
+  if (-not (Test-Path $tokenFile)) {
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $token = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+    Set-Content -Path $tokenFile -Value $token -Encoding ASCII -NoNewline
+    Write-Host "已生成随机 Token 并保存到 $name" -ForegroundColor Green
+  }
 }
 
 Write-Host "正在运行内置自动化自检（含三层树状 WebSocket 组网测试）..." -ForegroundColor Cyan

@@ -107,6 +107,16 @@ export class MiniWebSocket extends EventEmitter {
     this._handleClose(code, reason);
   }
 
+  terminate() {
+    if (this.closed) return;
+    try {
+      this.socket.destroy();
+    } catch {
+      // ignore
+    }
+    this._handleClose(1006, "terminated");
+  }
+
   _handleClose(code, reason) {
     if (this.closed) return;
     this.closed = true;

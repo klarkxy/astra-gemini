@@ -33,7 +33,7 @@ export function createSdk({ project }) {
     Array.isArray(project.allowedScripts) && project.allowedScripts.length > 0
       ? project.allowedScripts
       : DEFAULT_ALLOWED_SCRIPTS;
-  const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npmBin = "npm";
 
   return {
     listScripts() {
@@ -62,6 +62,7 @@ export function createSdk({ project }) {
       const res = spawnSync(npmBin, ["run", scriptName], {
         cwd: project.root,
         encoding: "utf8",
+        shell: process.platform === "win32",
         maxBuffer: 10 * 1024 * 1024
       });
       if (res.error) return { ok: false, error: `npm 启动失败: ${res.error.message}` };

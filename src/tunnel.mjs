@@ -2,8 +2,8 @@ import { spawn, spawnSync } from "node:child_process";
 
 export function checkEnvironment() {
   const probe = (cmd, args = ["--version"]) => {
-    const bin = process.platform === "win32" && ["npm", "pnpm"].includes(cmd) ? `${cmd}.cmd` : cmd;
-    const res = spawnSync(bin, args, { encoding: "utf8", timeout: 5000 });
+    const needsShell = process.platform === "win32" && ["npm", "pnpm"].includes(cmd);
+    const res = spawnSync(cmd, args, { encoding: "utf8", timeout: 5000, shell: needsShell });
     if (res.error || res.status !== 0) return { available: false, version: "" };
     const text = (res.stdout || res.stderr || "").trim().split(/\r?\n/)[0] || "";
     return { available: true, version: text };
@@ -19,13 +19,16 @@ export function checkEnvironment() {
   };
 }
 
-export function createTunnelManager(port) {
+export function createTunnelManager(port, getTunnelConfig = () => null) {
   let child = null;
   let publicUrl = null;
   let lastError = null;
+  let stderrTail = "";
+  let intentionalStop = false;
 
   function stop() {
     if (child) {
+      intentionalStop = true;
       try {
         child.kill();
       } catch {
@@ -43,14 +46,31 @@ export function createTunnelManager(port) {
     }
     lastError = null;
     publicUrl = null;
+    stderrTail = "";
+    intentionalStop = false;
+    const cfg = getTunnelConfig() || {};
+    const isNamed = cfg.mode === "named";
+    if (isNamed && !cfg.token) {
+      lastError = "命名隧道模式需要先保存 Tunnel Token";
+      return { ok: false, running: false, error: lastError };
+    }
     try {
-      child = spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true
-      });
+      child = isNamed
+        ? spawn("cloudflared", ["tunnel", "--no-autoupdate", "run"], {
+            env: { ...process.env, TUNNEL_TOKEN: cfg.token },
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true
+          })
+        : spawn("cloudflared", ["tunnel", "--url", `http://127.0.0.1:${port}`], {
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true
+          });
     } catch (err) {
       lastError = err.message;
       return { ok: false, running: false, error: lastError };
+    }
+    if (isNamed && cfg.publicUrl) {
+      publicUrl = cfg.publicUrl.replace(/\/+$/, "");
     }
 
     const scan = (chunk) => {
@@ -58,8 +78,15 @@ export function createTunnelManager(port) {
       const m = text.match(/https:\/\/[a-zA-Z0-9-]+\.trycloudflare\.com/);
       if (m) publicUrl = m[0];
     };
-    child.stdout.on("data", scan);
-    child.stderr.on("data", scan);
+    if (isNamed) {
+      child.stdout.on("data", () => {});
+      child.stderr.on("data", (c) => {
+        stderrTail = (stderrTail + c.toString("utf8")).slice(-2048);
+      });
+    } else {
+      child.stdout.on("data", scan);
+      child.stderr.on("data", scan);
+    }
     child.on("error", (err) => {
       lastError = err.message;
       child = null;
@@ -67,6 +94,9 @@ export function createTunnelManager(port) {
     child.on("close", () => {
       child = null;
       publicUrl = null;
+      if (isNamed && !intentionalStop && stderrTail.trim()) {
+        lastError = stderrTail.trim().split(/\r?\n/).filter(Boolean).slice(-3).join(" | ").slice(0, 500);
+      }
     });
 
     return { ok: true, running: true, publicUrl };
