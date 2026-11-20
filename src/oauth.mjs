@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
+import dns from "node:dns";
 import fs from "node:fs";
+import https from "node:https";
+import net from "node:net";
 import { writeSecretFile } from "./secure-file.mjs";
 
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
@@ -7,6 +10,10 @@ const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CODE_TTL_MS = 60 * 1000;
 const FAIL_WINDOW_MS = 10 * 60 * 1000;
 const FAIL_LIMIT = 10;
+const CIMD_CACHE_TTL_MS = 10 * 60 * 1000;
+const CIMD_NEG_CACHE_TTL_MS = 60 * 1000;
+const CIMD_MAX_BYTES = 64 * 1024;
+const CIMD_TIMEOUT_MS = 5000;
 
 function sha256hex(value) {
   return crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
@@ -59,6 +66,111 @@ function redirectMatches(registered, candidate) {
     // fall through
   }
   return false;
+}
+
+// OAuth Client ID Metadata Document: client_id is an https URL that hosts the
+// client metadata (redirect_uris, ...). Used by Gemini Connected Apps.
+function isClientIdUrl(s) {
+  try {
+    const u = new URL(String(s || ""));
+    return u.protocol === "https:" && u.pathname !== "/" && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
+function isPublicIp(ip) {
+  if (net.isIPv4(ip)) {
+    const p = ip.split(".").map(Number);
+    return !(
+      p[0] === 0 || p[0] === 10 || p[0] === 127 ||
+      (p[0] === 169 && p[1] === 254) ||
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+      (p[0] === 192 && p[1] === 168) ||
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
+      (p[0] === 192 && p[1] === 0 && p[2] === 0) ||
+      (p[0] === 192 && p[1] === 0 && p[2] === 2) ||
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) ||
+      (p[0] === 198 && p[1] === 51 && p[2] === 100) ||
+      (p[0] === 203 && p[1] === 0 && p[2] === 113) ||
+      p[0] >= 224
+    );
+  }
+  if (net.isIPv6(ip)) {
+    const low = ip.toLowerCase();
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(low);
+    if (mapped) return isPublicIp(mapped[1]);
+    const first = parseInt(low.split(":")[0] || "0", 16);
+    // ::/8（含 loopback/unspecified）、fc00::/7 (ULA)、fe80::/9（含 link-local fe80::/10 与已废弃 site-local）、ff00::/8 (multicast)
+    if (first === 0 || (first & 0xfe00) === 0xfc00 || (first & 0xff80) === 0xfe80 || (first & 0xff00) === 0xff00) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+async function defaultFetchClientMetadata(clientIdUrl) {
+  const u = new URL(clientIdUrl);
+  if (u.port && u.port !== "443") throw new Error("client_id URL 必须使用 443 端口");
+  const addrs = await dns.promises.lookup(u.hostname, { all: true });
+  if (!addrs.length || addrs.some((a) => !isPublicIp(a.address))) {
+    throw new Error("client_id URL 解析到非公网地址");
+  }
+  // 固定 DNS 解析结果，防 DNS rebinding（TOCTOU）。
+  const lookup = (hostname, options, cb) => {
+    if (hostname !== u.hostname) return cb(new Error("blocked hostname re-resolution"));
+    if (options && options.all) return cb(null, addrs);
+    cb(null, addrs[0].address, addrs[0].family);
+  };
+  const body = await new Promise((resolve, reject) => {
+    const req = https.get(
+      u,
+      { lookup, timeout: CIMD_TIMEOUT_MS, headers: { accept: "application/json" } },
+      (res) => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`客户端元数据请求返回 HTTP ${res.statusCode}`));
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => {
+          data += c;
+          if (data.length > CIMD_MAX_BYTES) req.destroy(new Error("客户端元数据过大"));
+        });
+        res.on("end", () => resolve(data));
+        res.on("error", reject);
+      }
+    );
+    req.on("timeout", () => req.destroy(new Error("客户端元数据请求超时")));
+    req.on("error", reject);
+  });
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error("客户端元数据不是合法 JSON");
+  }
+}
+
+function clientFromMetadataDoc(clientIdUrl, doc) {
+  if (!doc || typeof doc !== "object") throw new Error("客户端元数据格式非法");
+  if (doc.client_id !== clientIdUrl) throw new Error("元数据中的 client_id 与 URL 不一致");
+  const uris = Array.isArray(doc.redirect_uris) ? doc.redirect_uris : [];
+  if (!uris.length || uris.some((r) => typeof r !== "string" || !isAllowedRedirectUri(r))) {
+    throw new Error("客户端元数据缺少合法 redirect_uris");
+  }
+  const method = doc.token_endpoint_auth_method || "none";
+  if (method !== "none") throw new Error(`不支持的客户端认证方式: ${method}`);
+  return {
+    client_id: clientIdUrl,
+    client_secret_hash: null,
+    client_name: typeof doc.client_name === "string" ? doc.client_name.slice(0, 120) : clientIdUrl,
+    redirect_uris: uris.slice(0, 20),
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    metadataDocument: true
+  };
 }
 
 function sendJson(res, status, obj, extraHeaders = {}) {
@@ -124,11 +236,13 @@ export function createOAuthServer({
   verifyPassword,
   maxClients = 200,
   registerLimit = 20,
-  registerWindowMs = 60 * 60 * 1000
+  registerWindowMs = 60 * 60 * 1000,
+  fetchClientMetadata = defaultFetchClientMetadata
 }) {
   const codes = new Map();
   const authFailures = [];
   const registerAttempts = [];
+  const cimdCache = new Map();
   let lockoutUntil = 0;
 
   let state;
@@ -214,6 +328,28 @@ export function createOAuthServer({
     return state.clients.find((c) => c.client_id === clientId) || null;
   }
 
+  // 解析 client_id：先查已注册客户端，再按 Client ID Metadata Document 拉取元数据。
+  async function resolveClient(clientId) {
+    const registered = findClient(clientId);
+    if (registered) return registered;
+    if (!isClientIdUrl(clientId)) return null;
+    const cached = cimdCache.get(clientId);
+    if (cached && cached.exp > Date.now()) {
+      if (cached.client) return cached.client;
+      throw cached.error;
+    }
+    try {
+      const doc = await fetchClientMetadata(clientId);
+      const client = clientFromMetadataDoc(clientId, doc);
+      if (cimdCache.size > 100) cimdCache.clear();
+      cimdCache.set(clientId, { client, exp: Date.now() + CIMD_CACHE_TTL_MS });
+      return client;
+    } catch (err) {
+      cimdCache.set(clientId, { error: err, exp: Date.now() + CIMD_NEG_CACHE_TTL_MS });
+      throw err;
+    }
+  }
+
   function hasActiveTokens(clientId) {
     const now = Date.now();
     return (
@@ -222,7 +358,7 @@ export function createOAuthServer({
     );
   }
 
-  function authenticateClient(req, params) {
+  async function authenticateClient(req, params) {
     let clientId = params.get("client_id") || "";
     let secret = params.get("client_secret") || "";
     const auth = String(req.headers.authorization || "");
@@ -235,7 +371,7 @@ export function createOAuthServer({
         secret = decodeURIComponent(decoded.slice(idx + 1));
       }
     }
-    const client = findClient(clientId);
+    const client = await resolveClient(clientId).catch(() => null);
     if (!client) {
       return { status: 401, body: { error: "invalid_client", error_description: "Unknown client_id." } };
     }
@@ -270,7 +406,13 @@ export function createOAuthServer({
       return true;
     };
 
-    const client = findClient(params.get("client_id") || "");
+    const clientId = params.get("client_id") || "";
+    let client;
+    try {
+      client = await resolveClient(clientId);
+    } catch (err) {
+      return failPage("授权失败", `客户端元数据校验失败：${err.message}`);
+    }
     if (!client) return failPage("授权失败", "未知的 client_id。");
     const redirectUri = params.get("redirect_uri") || "";
     if (!redirectUri || !client.redirect_uris.some((r) => redirectMatches(r, redirectUri))) {
@@ -332,7 +474,13 @@ export function createOAuthServer({
     }
     const get = (k) => params.get(k) || "";
 
-    const client = findClient(get("client_id"));
+    let client;
+    try {
+      client = await resolveClient(get("client_id"));
+    } catch (err) {
+      sendHtml(res, 400, renderErrorPage("授权失败", `客户端元数据校验失败：${err.message}`));
+      return true;
+    }
     if (!client) {
       sendHtml(res, 400, renderErrorPage("授权失败", "未知的 client_id。"));
       return true;
@@ -416,7 +564,7 @@ export function createOAuthServer({
       return true;
     }
 
-    const auth = authenticateClient(req, params);
+    const auth = await authenticateClient(req, params);
     if (!auth.client) {
       sendJson(res, auth.status, auth.body, auth.headers || {});
       return true;
@@ -494,6 +642,7 @@ export function createOAuthServer({
         grant_types_supported: ["authorization_code", "refresh_token"],
         code_challenge_methods_supported: ["S256"],
         token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
+        client_id_metadata_document_supported: true,
         scopes_supported: ["mcp"]
       });
       return true;

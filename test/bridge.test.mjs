@@ -830,6 +830,145 @@ test("Astra Gemini OAuth 2.1: DCR, authorize, PKCE, refresh rotation, persistenc
   }
 });
 
+test("Astra Gemini OAuth CIMD: client_id URL metadata document (Gemini Connected Apps)", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-cimd-"));
+  const demoRepo = path.join(tmpBase, "demo-repo");
+  initTempGitRepo(demoRepo);
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const clientToken = "cimd-client-tok";
+  const clientIdUrl = "https://accountlinking.google.com/clientidmetadata/user_bound_provider/test-client";
+  const googleRedirect = "https://oauth-redirect.googleusercontent.com/r/gemini-test";
+  const fetchCalls = [];
+  let docOverride = null;
+  const fetchClientMetadata = async (url) => {
+    fetchCalls.push(url);
+    if (docOverride) return docOverride;
+    return {
+      client_id: url,
+      client_name: "Gemini",
+      redirect_uris: [googleRedirect],
+      token_endpoint_auth_method: "none"
+    };
+  };
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    projectsConfigPath: projectsConfig,
+    nodeId: "o",
+    authMode: "bearer",
+    authToken: clientToken,
+    joinToken: "j",
+    fetchClientMetadata
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+  const base = `http://127.0.0.1:${port}`;
+
+  try {
+    const as = await fetch(`${base}/.well-known/oauth-authorization-server`).then((r) => r.json());
+    assert.equal(as.client_id_metadata_document_supported, true);
+
+    const verifier = `v-${crypto.randomBytes(32).toString("base64url")}`;
+    const challenge = crypto.createHash("sha256").update(verifier, "utf8").digest("base64url");
+    const authParams = {
+      client_id: clientIdUrl,
+      response_type: "code",
+      redirect_uri: googleRedirect,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "st-cimd",
+      resource: `${base}/mcp`
+    };
+
+    // 未注册过的普通 client_id 仍被拒绝
+    const unknown = await fetch(
+      `${base}/oauth/authorize?` + new URLSearchParams({ ...authParams, client_id: "mcp_unknown" }),
+      { redirect: "manual" }
+    );
+    assert.equal(unknown.status, 400);
+    assert.match(await unknown.text(), /未知的 client_id/);
+
+    // redirect_uri 不在元数据文档中 → 拒绝
+    const badUri = await fetch(
+      `${base}/oauth/authorize?` +
+        new URLSearchParams({ ...authParams, redirect_uri: "https://oauth-redirect.googleusercontent.com/evil" }),
+      { redirect: "manual" }
+    );
+    assert.equal(badUri.status, 400);
+    assert.equal(badUri.headers.get("location"), null);
+
+    // 元数据 doc.client_id 与 URL 不一致 → 拒绝（换一个新的 client_id URL 避开缓存）
+    const badClientIdUrl = "https://accountlinking.google.com/clientidmetadata/user_bound_provider/bad-client";
+    docOverride = { client_id: "https://other.example.com/meta", redirect_uris: [googleRedirect] };
+    const mismatch = await fetch(
+      `${base}/oauth/authorize?` + new URLSearchParams({ ...authParams, client_id: badClientIdUrl }),
+      { redirect: "manual" }
+    );
+    assert.equal(mismatch.status, 400);
+    assert.match(await mismatch.text(), /client_id 与 URL 不一致/);
+    docOverride = null;
+
+    // 完整流程：授权页 → 口令 → code → token
+    const getAuth = await fetch(`${base}/oauth/authorize?` + new URLSearchParams(authParams), {
+      redirect: "manual"
+    });
+    assert.equal(getAuth.status, 200);
+    assert.match(await getAuth.text(), /Gemini/);
+
+    const rightPw = await fetch(`${base}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ ...authParams, password: clientToken }),
+      redirect: "manual"
+    });
+    assert.equal(rightPw.status, 302);
+    const loc = new URL(rightPw.headers.get("location"));
+    assert.equal(loc.origin + loc.pathname, googleRedirect);
+    assert.equal(loc.searchParams.get("state"), "st-cimd");
+    const code = loc.searchParams.get("code");
+    assert.ok(code);
+
+    const tok = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: clientIdUrl,
+        code,
+        redirect_uri: googleRedirect,
+        code_verifier: verifier
+      })
+    });
+    assert.equal(tok.status, 200);
+    const tokens = await tok.json();
+    assert.ok(tokens.access_token && tokens.refresh_token);
+
+    const mcpRes = await rpc(base, tokens.access_token, "tools/list");
+    assert.equal(mcpRes.status, 200);
+    assert.ok(mcpRes.body.result.tools.length >= 5);
+
+    const ref = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: clientIdUrl,
+        refresh_token: tokens.refresh_token
+      })
+    });
+    assert.equal(ref.status, 200);
+
+    // 命中缓存：正常 client 的两次 authorize + 两次 token 只拉取一次元数据
+    assert.deepEqual(fetchCalls, [clientIdUrl, badClientIdUrl]);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
 test("Astra Gemini keepalive: parent sweeps dead children, child reconnects on silent upstream", async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-keepalive-"));
   const parentDir = makeTempBridgeRoot(tmpBase, "parent");

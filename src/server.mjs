@@ -304,7 +304,8 @@ export function createBridgeServer(options = {}) {
     verifyPassword: (pw) => tokenEqual(authToken, pw),
     maxClients: options.oauthMaxClients,
     registerLimit: options.oauthRegisterLimit,
-    registerWindowMs: options.oauthRegisterWindowMs
+    registerWindowMs: options.oauthRegisterWindowMs,
+    fetchClientMetadata: options.fetchClientMetadata
   });
 
   function tokenEqual(expected, actual) {
