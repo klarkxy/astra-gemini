@@ -176,6 +176,22 @@ A、B 是两台各自运行 astra-gemini 的机器。A 本机的 AI 客户端连
 
 `npm test`（即 `node --test test/bridge.test.mjs`，node:test 零依赖）覆盖：单节点工具链与项目防火墙、快照去重与补丁完整性/gzip、沙箱逃逸防护、直连升级与中继回退、Token 隔离、TOFU 劫持与重置、OAuth 全流程、心跳重连、跨节点超时。
 
+## 开发控制台
+
+控制台源码在 `web/`（Vite + React + TypeScript + Tailwind + shadcn/ui），构建产物即 `src/ui.html`。
+
+```powershell
+# 先启动一个开发用服务端（控制台通过它代理 /api 与 /remote）
+$env:HOST="127.0.0.1"; $env:PORT="3940"; $env:AUTH_MODE="none"; node src/server.mjs
+
+# 另开终端：安装依赖并启动前端开发服务器
+cd web
+npm install
+npm run dev
+```
+
+改动后运行 `cd web && npm run build`（先 typecheck 再打包）重新生成 `src/ui.html`。`src/ui.html` 是随仓库提交的运行产物，终端用户无需构建前端。开发服务器只绑定 127.0.0.1，不要用 `--host` 对外暴露（代理会剥离 Origin/Sec-Fetch-Site 校验头，暴露即失去该防护）。
+
 ## 许可证
 
 Apache License 2.0，详见 `LICENSE` 与 `NOTICE`。

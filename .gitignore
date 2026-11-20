@@ -16,3 +16,4 @@ nodes.json
 oauth-state.json
 identity.json
 notes/
+web/dist/
