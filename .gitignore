@@ -12,6 +12,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 join-token.txt
+admin-key.txt
 nodes.json
 oauth-state.json
 identity.json

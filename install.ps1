@@ -21,7 +21,8 @@ if (-not (Test-Path $projectsFile)) {
   Write-Host "已生成 projects.json（启动后可直接在网页控制台里可视化编辑）" -ForegroundColor Yellow
 }
 
-foreach ($name in @("token.txt", "join-token.txt")) {
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+foreach ($name in @("token.txt", "join-token.txt", "admin-key.txt")) {
   $tokenFile = Join-Path $root $name
   if (-not (Test-Path $tokenFile)) {
     $bytes = New-Object byte[] 32
@@ -30,6 +31,7 @@ foreach ($name in @("token.txt", "join-token.txt")) {
     Set-Content -Path $tokenFile -Value $token -Encoding ASCII -NoNewline
     Write-Host "已生成随机 Token 并保存到 $name" -ForegroundColor Green
   }
+  icacls $tokenFile /inheritance:r /grant:r "*${currentSid}:F" | Out-Null
 }
 
 Write-Host "正在运行内置自动化自检（含三层树状 WebSocket 组网测试）..." -ForegroundColor Cyan

@@ -1,10 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { AnimatePresence, motion, MotionConfig } from "motion/react";
-import { Sparkle } from "lucide-react";
+import { Lock, Sparkle } from "lucide-react";
 import { cn, fmtUptime } from "@/lib/utils";
+import { api, setAdminKey } from "@/lib/api";
 import { pageFromHash, StatusProvider, useStatus } from "@/lib/status";
 import type { PageId } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { OverviewPage } from "@/pages/OverviewPage";
@@ -135,6 +137,55 @@ function Shell({ page, go }: { page: PageId; go: (p: PageId) => void }) {
   );
 }
 
+function LockedScreen() {
+  const { refresh } = useStatus();
+  const [key, setKey] = useState("");
+  const [failed, setFailed] = useState(false);
+  async function unlock() {
+    const k = key.trim();
+    if (!k) return;
+    setAdminKey(k);
+    setKey("");
+    const s = await api.status();
+    setFailed(!s?.ok);
+    void refresh();
+  }
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="w-full max-w-sm">
+        <div className="flex items-center gap-2.5 pb-2">
+          <Lock className="text-primary size-5" />
+          <h2 className="font-display m-0 text-xl font-semibold">控制台已锁定</h2>
+        </div>
+        <p className="text-muted-foreground m-0 text-[13px]">
+          需要管理密钥：请从托盘菜单打开控制台，或粘贴 admin-key.txt 中的密钥。
+        </p>
+        <div className="mt-4 flex gap-2">
+          <Input
+            type="password"
+            value={key}
+            placeholder="粘贴管理密钥"
+            onChange={(e) => {
+              setKey(e.target.value);
+              setFailed(false);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void unlock();
+            }}
+          />
+          <Button onClick={() => void unlock()}>解锁</Button>
+        </div>
+        {failed && <p className="text-destructive m-0 mt-2 text-xs">解锁失败：密钥不正确或服务不可用。</p>}
+      </div>
+    </div>
+  );
+}
+
+function AuthedShell({ page, go }: { page: PageId; go: (p: PageId) => void }) {
+  const { locked } = useStatus();
+  return locked ? <LockedScreen /> : <Shell page={page} go={go} />;
+}
+
 export default function App() {
   const [page, setPage] = useState<PageId>(() => pageFromHash(window.location.hash));
 
@@ -152,7 +203,7 @@ export default function App() {
     <MotionConfig reducedMotion="user">
       <StatusProvider>
         <TooltipProvider>
-          <Shell page={page} go={go} />
+          <AuthedShell page={page} go={go} />
           <Toaster position="bottom-right" />
         </TooltipProvider>
       </StatusProvider>

@@ -7,12 +7,44 @@ import type {
 
 export type ApiResult = { ok?: boolean; error?: string } & Record<string, unknown>;
 
+const ADMIN_KEY_STORAGE = "astra-admin-key";
+
+const hashKey = /^#k=([^&]+)/.exec(window.location.hash || "");
+if (hashKey) {
+  try {
+    sessionStorage.setItem(ADMIN_KEY_STORAGE, hashKey[1]);
+  } catch {
+    // ignore
+  }
+  history.replaceState(null, "", window.location.pathname + window.location.search);
+}
+
+export function getAdminKey(): string {
+  try {
+    return sessionStorage.getItem(ADMIN_KEY_STORAGE) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setAdminKey(key: string) {
+  try {
+    sessionStorage.setItem(ADMIN_KEY_STORAGE, key);
+  } catch {
+    // ignore
+  }
+}
+
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
+  const adminKey = getAdminKey();
   let res: Response;
   try {
     res = await fetch(url, {
       method,
-      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      headers: {
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(adminKey ? { "X-Astra-Admin": adminKey } : {})
+      },
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
   } catch {

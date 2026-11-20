@@ -110,7 +110,19 @@ export function ProjectsPage() {
             </Field>
           </div>
           <FieldSet>
-            <FieldLegend className="text-muted-foreground text-xs font-normal">该项目允许调用的 SDK</FieldLegend>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <FieldLegend className="text-muted-foreground mb-0 text-xs font-normal">该项目允许调用的 SDK</FieldLegend>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setMode("readonly");
+                  setChecked(new Set(sdks.some((s) => s.name === "fs_read") ? ["fs_read"] : []));
+                }}
+              >
+                严格只读预设
+              </Button>
+            </div>
             <div className="flex flex-wrap gap-x-4 gap-y-1.5">
               {sdks.map((s) => (
                 <label key={s.name} className="flex cursor-pointer items-center gap-1.5 text-[13px]">

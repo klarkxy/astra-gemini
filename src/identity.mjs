@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { writeSecretFile } from "./secure-file.mjs";
 
 const B32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -111,7 +112,7 @@ export function loadIdentity(bridgeRoot) {
     privatePem = pair.privateKey.export({ type: "pkcs8", format: "pem" });
     publicPem = pair.publicKey.export({ type: "spki", format: "pem" });
     fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(filePath, JSON.stringify({ privatePem, publicPem }, null, 2) + "\n", "utf8");
+    writeSecretFile(filePath, JSON.stringify({ privatePem, publicPem }, null, 2) + "\n");
   }
 
   const privateKey = crypto.createPrivateKey(privatePem);

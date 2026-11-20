@@ -8,13 +8,6 @@ $Port = 3939
 $UiUrl = "http://127.0.0.1:$Port/ui"
 $McpUrl = "http://127.0.0.1:$Port/mcp"
 
-$createdNew = $false
-$mutex = New-Object System.Threading.Mutex($true, "Local\AstraGeminiTrayMutex", [ref]$createdNew)
-if (-not $createdNew) {
-  Start-Process $UiUrl
-  exit 0
-}
-
 function Get-OrCreateToken([string]$fileName) {
   $file = Join-Path $Root $fileName
   if (-not (Test-Path $file)) {
@@ -22,13 +15,24 @@ function Get-OrCreateToken([string]$fileName) {
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     $t = ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
     Set-Content -Path $file -Value $t -Encoding ASCII -NoNewline
-    return $t
   }
+  try {
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    icacls $file /inheritance:r /grant:r "*${sid}:F" | Out-Null
+  } catch {}
   return (Get-Content -Path $file -Raw).Trim()
 }
 
 $token = Get-OrCreateToken "token.txt"
 $joinToken = Get-OrCreateToken "join-token.txt"
+$adminKey = Get-OrCreateToken "admin-key.txt"
+
+$createdNew = $false
+$mutex = New-Object System.Threading.Mutex($true, "Local\AstraGeminiTrayMutex", [ref]$createdNew)
+if (-not $createdNew) {
+  Start-Process "$UiUrl#k=$adminKey"
+  exit 0
+}
 
 $projectsFile = Join-Path $Root "projects.json"
 if (-not (Test-Path $projectsFile)) {
@@ -73,6 +77,7 @@ function Start-Bridge {
   $psi.EnvironmentVariables["AUTH_MODE"] = "bearer"
   $psi.EnvironmentVariables["ASTRA_TOKEN"] = $token
   $psi.EnvironmentVariables["ASTRA_JOIN_TOKEN"] = $joinToken
+  $psi.EnvironmentVariables["ASTRA_ADMIN_KEY"] = $adminKey
   $script:nodeProc = [System.Diagnostics.Process]::Start($psi)
   Update-TrayUi
 }
@@ -104,7 +109,7 @@ function Update-TrayUi {
   $itemToggle.Text = if ($running) { "停止服务" } else { "启动服务" }
 }
 
-$itemOpen.Add_Click({ Start-Process $UiUrl })
+$itemOpen.Add_Click({ Start-Process "$UiUrl#k=$adminKey" })
 $itemToggle.Add_Click({
   if ($script:nodeProc -and -not $script:nodeProc.HasExited) { Stop-Bridge } else { Start-Bridge }
 })
@@ -129,12 +134,12 @@ $itemExit.Add_Click({
 })
 
 $notify.ContextMenuStrip = $menu
-$notify.Add_DoubleClick({ Start-Process $UiUrl })
+$notify.Add_DoubleClick({ Start-Process "$UiUrl#k=$adminKey" })
 
 Start-Bridge
 Start-Sleep -Milliseconds 600
 $notify.ShowBalloonTip(2500, "Astra Gemini 已启动", "双击托盘图标可随时打开星空双子座控制台。", [System.Windows.Forms.ToolTipIcon]::Info)
-Start-Process $UiUrl
+Start-Process "$UiUrl#k=$adminKey"
 
 try {
   [System.Windows.Forms.Application]::Run()

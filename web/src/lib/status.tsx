@@ -7,6 +7,7 @@ interface StatusCtx {
   remote: RemoteStatus | null;
   oauthClients: OauthClient[];
   error: string | null;
+  locked: boolean;
   refresh: () => Promise<void>;
 }
 
@@ -17,12 +18,17 @@ export function StatusProvider({ children }: { children: ReactNode }) {
   const [remote, setRemote] = useState<RemoteStatus | null>(null);
   const [oauthClients, setOauthClients] = useState<OauthClient[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [locked, setLocked] = useState(false);
 
   const refresh = useCallback(async () => {
     const [s, o, r] = await Promise.all([api.status(), api.oauth(), api.remote()]);
-    if (s?.ok) {
+    if ((s as (StatusResponse & { code?: string }) | null)?.code === "admin_auth_required") {
+      setLocked(true);
+      setError(s?.error || "需要管理密钥");
+    } else if (s?.ok) {
       setStatus(s);
       setError(null);
+      setLocked(false);
     } else {
       setError(s?.error || "状态获取失败");
     }
@@ -45,7 +51,7 @@ export function StatusProvider({ children }: { children: ReactNode }) {
     };
   }, [refresh]);
 
-  return <Ctx.Provider value={{ status, remote, oauthClients, error, refresh }}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={{ status, remote, oauthClients, error, locked, refresh }}>{children}</Ctx.Provider>;
 }
 
 export function useStatus(): StatusCtx {

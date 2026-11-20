@@ -12,16 +12,17 @@
 2. 右键 `install.ps1` → **使用 PowerShell 运行**：检查 Node/Git、生成两个 Token 文件、运行完整测试套件、创建桌面快捷方式。
 3. 双击桌面「Astra Gemini」（或目录内 `Start-AstraGemini.vbs`）：托盘驻留并自动打开控制台 `http://127.0.0.1:3939/ui`（仅本机可访问）。
 
-安装目录下会生成两个 Token 文件（均已 gitignore）：
+安装目录下会生成三个密钥文件（均已 gitignore）：
 
 | 文件 | 用途 |
 | --- | --- |
 | `token.txt` | **客户端 Token**：`/mcp` 的 Bearer 凭据，同时是 OAuth 授权页的登录口令 |
 | `join-token.txt` | **入网 Token**：仅供子节点通过 `wss://…/ws/tree` 挂载到本节点 |
+| `admin-key.txt` | **管理密钥**：本地控制台 `/api/*` 凭据（`X-Astra-Admin`），托盘打开控制台时自动携带 |
 
 控制台五个页签：SDK 能力开关 / 本地项目 / 星图组网 / 备份回滚 / 自检与日志。托盘菜单可复制本机 MCP 地址、客户端 Token、入网 Token。
 
-也可不用托盘直接启动：`HOST=127.0.0.1 PORT=3939 AUTH_MODE=bearer ASTRA_TOKEN=… ASTRA_JOIN_TOKEN=… node src/server.mjs`（`AUTH_MODE=none` 完全免鉴权，仅限本机测试）。
+也可不用托盘直接启动：`HOST=127.0.0.1 PORT=3939 AUTH_MODE=bearer ASTRA_TOKEN=… ASTRA_JOIN_TOKEN=… ASTRA_ADMIN_KEY=… node src/server.mjs`（`AUTH_MODE=none` 完全免鉴权，仅限本机测试）。手动启动后控制台请打开 `http://127.0.0.1:3939/ui#k=<管理密钥>`；未设 `ASTRA_ADMIN_KEY` 时 bearer 模式回退用客户端 Token 作管理密钥。
 
 ## MCP 接口与工具
 
@@ -53,10 +54,12 @@
 
 | SDK | 函数 | 限制 |
 | --- | --- | --- |
-| `git` | `status`、`diff({statOnly,maxChars})`、`log(limit≤30)`、`branches`、`rollback(backupId)` | 只读查询 + 补丁备份回滚 |
-| `npm` | `listScripts`、`run(scriptName,{tailLines≤120})` | 仅 `allowedScripts` 白名单脚本（默认 `test/lint/typecheck/check/build/verify`） |
+| `git` | `status`、`diff({statOnly,maxChars})`、`show(rev,path?)`、`blame(path,{startLine,endLine})`、`log(limit≤30)`、`branches`、`rollback(backupId)` | 只读查询 + 补丁备份回滚；diff/show/blame 均遵守 deny 规则，diff 剔除敏感文件并返回 `hiddenCount`，show 不带 path 只输出 `--stat` 概要 |
+| `npm` | `listScripts`、`run(scriptName,{tailLines≤120})` | 仅 `allowedScripts` 白名单脚本（默认 `test/lint/typecheck/check/build/verify`）；按 `packageManager` 字段或 lockfile 自动识别 npm/yarn/pnpm/bun |
 | `pnpm` | `listScripts`、`listWorkspaces`、`run(scriptName,{filter,tailLines})` | 同上；`filter` 仅允许 `^[a-zA-Z0-9@/_.*-]+$` |
 | `python` | `info`、`pytest(target,{keyword,tailLines})`、`compileCheck(target)` | 优先使用项目内 `.venv`/`venv` 解释器 |
+| `cargo` | `info`、`run(subcommand,{package,tailLines})` | 子命令白名单 `check/test/clippy/build/fmt`；`fmt` 等价于 `fmt --check` 只校验不改写 |
+| `go` | `info`、`run(subcommand,{pkg,run,tailLines})` | 子命令白名单 `build/test/vet`；`run` 仅 `test` 可用（`-run` 测试名过滤） |
 | `http` | `probePort(port,timeoutMs≤5000)`、`request(url,{method,headers,body,maxChars})` | 仅允许访问 `127.0.0.1`/`localhost`/`::1` |
 | `fs_read` | `stat`、`tail(relPath,lines≤200)`、`grep(pattern,subdir,maxMatches≤40)` | 项目内只读，遵守 deny 规则 |
 | `worktree` | `list`、`create(name,ref)`、`remove(name)` | 默认关闭；在 `.bridge-worktrees/<项目>/<name>` 建隔离工作树，名称限 `^[a-zA-Z0-9_-]{1,48}$` |
@@ -80,7 +83,7 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
 
 - 项目别名：`^[a-zA-Z0-9_-]{1,64}$`；`root` 必填且必须已存在。
 - `mode`：`direct`（默认，允许打补丁）或 `readonly`（拒绝 `apply_patch`）。
-- `sdks`：缺省为 `["git","pnpm","npm","python","http","fs_read"]`（不含 `worktree`）；`"*"` 表示全部全局启用的 SDK。
+- `sdks`：缺省为 `["git","pnpm","npm","python","cargo","go","http","fs_read"]`（不含 `worktree`）；`"*"` 表示全部全局启用的 SDK。
 - `allowedScripts`：缺省为内置白名单 `test/lint/typecheck/check/build/verify`。
 - `deny`：追加屏蔽规则。**默认 deny 不可关闭**，对所有文件读取/快照/补丁生效：`.env*`、`**/*.pem|key|p12|pfx`、`**/*secret*`、`**/id_rsa*|id_ed25519*`、`.git/**`、`node_modules/**`、`.bridge-backup/**`。
 - 也可在控制台「本地项目」页签可视化编辑。
@@ -89,10 +92,10 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
 
 - **两类凭据权限边界**：客户端 Token → `/mcp` 全部工具 + OAuth 登录口令；入网 Token → 仅 `/ws/tree` 注册。两者互不相通（交叉使用均 401），比较均使用恒定时算法。
 - **重要**：拿到客户端 Token（或完成 OAuth 授权）的调用方，对每个 `mode: "direct"` 项目约等于拥有本机用户的代码执行能力——可先 `apply_patch` 修改 `package.json`，再 `exec_verify` 调 `sdk.npm.run` 执行。只给受信任的 AI/节点授权。
-- `readonly` 仅阻止 `apply_patch` 写盘，**不阻止 `exec_verify`**（其后果取决于启用的 SDK，如 `npm run build` 仍会写产物）。需要严格只读时，请同时把项目 `sdks` 收缩为 `["fs_read"]` 等纯读集合。
+- `readonly` 仅阻止 `apply_patch` 写盘，**不阻止 `exec_verify`**（其后果取决于启用的 SDK，如 `npm run build` 仍会写产物）。需要严格只读时，请同时把项目 `sdks` 收缩为 `["fs_read"]` 等纯读集合——控制台「本地项目」页签的「严格只读预设」按钮可一键填入该组合。
 - 上级节点的 `/mcp` 凭据持有者可对整棵子树（含全部后代节点的项目）发起工具调用；入网 Token 只决定谁能挂载上来，不约束上级的调用能力。
 - `exec_verify` 沙箱边界：独立 `node --permission` 子进程，仅 `--allow-fs-read` 自身文件；SDK 调用经宿主端白名单校验的 IPC 代理，返回值 JSON 序列化。已知残余风险：`process.kill`/`process.abort` 不受权限模型管控（脚本可终止自身或信号同用户进程）；CPU/内存仅靠超时兜底（默认 30s、上限 120s）。
-- 管理控制台（`/ui`、`/api/*`）只接受本机 socket，且校验 Host（仅 `127.0.0.1`/`localhost`/`::1`）、Origin 必须同源、拒绝 `Sec-Fetch-Site: cross-site`（防 DNS rebinding 与跨站提交）。经公网入口到达的管理请求一律 403。
+- 管理控制台（`/ui`、`/api/*`）只接受本机 socket，且校验 Host（仅 `127.0.0.1`/`localhost`/`::1`）、Origin 必须同源、拒绝 `Sec-Fetch-Site: cross-site`（防 DNS rebinding 与跨站提交）。经公网入口到达的管理请求一律 403。`/api/*` 另需 `X-Astra-Admin` 管理密钥（`ASTRA_ADMIN_KEY` 或 `admin-key.txt`；未配置时 bearer 模式回退为客户端 Token；`AUTH_MODE=none` 不校验），防本机其他进程/用户伪造管理请求。桥接器密钥文件（`token.txt`、`join-token.txt`、`admin-key.txt`、`identity.json`、`settings.json`、`nodes.json`、`oauth-state.json`）创建时及每次启动均收紧 ACL 至仅当前用户可读写（Windows icacls / POSIX 0600）。
 - OAuth 防护：强制 PKCE S256；授权码 60 秒一次性；refresh token 轮换（旧值立即失效）；access token 1 小时、refresh token 30 天；授权口令 10 分钟内失败超 10 次锁定 10 分钟；`/oauth/register` 限流（默认每小时 20 次、客户端上限 200，超限时优先驱逐无活跃令牌的客户端）。
 - 节点 TOFU 绑定：子节点首次注册将 `nodeId → sha256(nodeSecret)` 落盘 `nodes.json`；此后同名不同密的连接被 `1008` 拒绝且不顶替现有连接，控制台「星图组网」可一键移除重置。
 - 直连票据 15 秒一次性单用；心跳每 25 秒一次、超过 75 秒无应答断开并自动重连（退避重试，成功即重置）。
@@ -118,7 +121,7 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
    ```
 3. `sudo cp deploy/astra-gemini.service /etc/systemd/system/ && sudo systemctl enable --now astra-gemini`。
 4. `deploy/Caddyfile` 改为你的域名放入 Caddy（`reverse_proxy 127.0.0.1:3939`，WebSocket 自动透传），`sudo systemctl reload caddy`。
-5. 控制台访问：本机 `ssh -L 3939:127.0.0.1:3939 user@vps`，浏览器开 `http://127.0.0.1:3939/ui`（管理面只认 localhost）。
+5. 控制台访问：本机 `ssh -L 3939:127.0.0.1:3939 user@vps`，浏览器开 `http://127.0.0.1:3939/ui#k=<管理密钥>`（管理面只认 localhost 且 `/api/*` 需 `X-Astra-Admin`；未设 `ASTRA_ADMIN_KEY` 时管理密钥即客户端 Token）。
 
 ### 方案 B：Cloudflare 命名隧道（免 VPS）
 
@@ -165,7 +168,7 @@ A、B 是两台各自运行 astra-gemini 的机器。A 本机的 AI 客户端连
 | --- | --- |
 | `settings.json` | `nodeId`、`nodeSecret`、上游/隧道 Token、`publicUrl`、SDK 与直连开关（含敏感信息） |
 | `projects.json` | 项目注册表（见上文） |
-| `token.txt` / `join-token.txt` | 客户端 Token / 入网 Token |
+| `token.txt` / `join-token.txt` / `admin-key.txt` | 客户端 Token / 入网 Token / 管理密钥 |
 | `nodes.json` | 子节点 TOFU 绑定（`nodeId → sha256(nodeSecret)`） |
 | `oauth-state.json` | OAuth 客户端与令牌哈希（不存明文令牌） |
 | `identity.json` | Ed25519 节点密钥对（`ag1-` 地址的来源；私钥泄露=节点身份被冒充） |

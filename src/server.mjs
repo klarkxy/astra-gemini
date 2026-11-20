@@ -14,6 +14,7 @@ import { createTreeManager, PROTOCOL_VERSION } from "./tree.mjs";
 import { createOAuthServer } from "./oauth.mjs";
 import { loadIdentity } from "./identity.mjs";
 import { createRemoteManager } from "./remote.mjs";
+import { hardenSecretFiles, writeSecretFile } from "./secure-file.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRIDGE_ROOT = path.resolve(__dirname, "..");
@@ -204,7 +205,9 @@ export function createBridgeServer(options = {}) {
   const authMode = options.authMode ?? process.env.AUTH_MODE ?? "bearer";
   const authToken = options.authToken ?? process.env.ASTRA_TOKEN ?? process.env.KIMI_BRIDGE_TOKEN ?? "";
   const joinToken = options.joinToken ?? process.env.ASTRA_JOIN_TOKEN ?? "";
+  const adminKey = (options.adminKey ?? process.env.ASTRA_ADMIN_KEY) || (authMode === "bearer" ? authToken : "");
   const fixedNodeId = options.nodeId || process.env.ASTRA_NODE_ID || null;
+  hardenSecretFiles(bridgeRoot);
   const startedAt = Date.now();
   const recentLogs = [];
   const tunnel = createTunnelManager(port, () => loadSettings(bridgeRoot).tunnel);
@@ -243,7 +246,7 @@ export function createBridgeServer(options = {}) {
     }
     if (migrated) {
       try {
-        fs.writeFileSync(nodesFilePath, JSON.stringify(out, null, 2) + "\n", "utf8");
+        writeSecretFile(nodesFilePath, JSON.stringify(out, null, 2) + "\n");
       } catch {
         // ignore
       }
@@ -251,7 +254,7 @@ export function createBridgeServer(options = {}) {
     return out;
   }
   function saveNodeBindings(all) {
-    fs.writeFileSync(nodesFilePath, JSON.stringify(all, null, 2) + "\n", "utf8");
+    writeSecretFile(nodesFilePath, JSON.stringify(all, null, 2) + "\n");
   }
   const nodeStore = {
     get(nodeId) {
@@ -535,6 +538,15 @@ export function createBridgeServer(options = {}) {
         }
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(fs.readFileSync(UI_HTML_PATH, "utf8"));
+        return;
+      }
+
+      if (authMode !== "none" && !tokenEqual(adminKey, req.headers["x-astra-admin"])) {
+        sendJson(req, res, 401, {
+          ok: false,
+          code: "admin_auth_required",
+          error: "需要管理密钥：请从托盘菜单打开控制台，或粘贴 admin-key.txt 中的密钥。"
+        });
         return;
       }
 

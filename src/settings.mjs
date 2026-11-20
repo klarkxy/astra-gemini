@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeSecretFile } from "./secure-file.mjs";
 
 function defaultNodeId() {
   const raw = (os.hostname() || "node").toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -42,6 +43,8 @@ export const DEFAULT_SETTINGS = {
     pnpm: true,
     npm: true,
     python: true,
+    cargo: true,
+    go: true,
     http: true,
     fs_read: true,
     worktree: false
@@ -90,7 +93,7 @@ export function loadSettings(bridgeRoot) {
   if (typeof merged.nodeSecret !== "string" || !/^[0-9a-f]{64}$/i.test(merged.nodeSecret)) {
     merged.nodeSecret = crypto.randomBytes(32).toString("hex");
     try {
-      fs.writeFileSync(filePath, JSON.stringify(merged, null, 2) + "\n", "utf8");
+      writeSecretFile(filePath, JSON.stringify(merged, null, 2) + "\n");
     } catch {
       // ignore
     }
@@ -117,6 +120,6 @@ export function saveSettings(bridgeRoot, nextSettings) {
     }
   };
   const filePath = getSettingsPath(bridgeRoot);
-  fs.writeFileSync(filePath, JSON.stringify(merged, null, 2) + "\n", "utf8");
+  writeSecretFile(filePath, JSON.stringify(merged, null, 2) + "\n");
   return merged;
 }

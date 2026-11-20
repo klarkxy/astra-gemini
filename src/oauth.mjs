@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { writeSecretFile } from "./secure-file.mjs";
 
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -161,7 +162,7 @@ export function createOAuthServer({
   function save() {
     prune();
     try {
-      fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      writeSecretFile(statePath, JSON.stringify(state, null, 2) + "\n");
     } catch {
       // ignore
     }

@@ -6,7 +6,7 @@ import type { SdkInfo } from "@/lib/types";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Switch } from "@/components/ui/switch";
-import { PageHead, SkeletonRows, StatusTag } from "@/components/bits";
+import { PageHead, SkeletonRows } from "@/components/bits";
 
 function SdkItem({ sdk, onToggle }: { sdk: SdkInfo; onToggle: (name: string, enabled: boolean) => void }) {
   const fns = Object.entries(sdk.functions || {});
@@ -15,7 +15,6 @@ function SdkItem({ sdk, onToggle }: { sdk: SdkInfo; onToggle: (name: string, ena
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="font-display text-base font-semibold">{sdk.title || sdk.name}</span>
-          <StatusTag>{sdk.category || "dev"}</StatusTag>
           <code className="text-muted-foreground font-mono text-xs">{sdk.name}</code>
         </div>
         {sdk.description && (
@@ -59,6 +58,13 @@ export function SdksPage() {
     );
   }
   const sdks = status.sdks || [];
+  const groups = new Map<string, SdkInfo[]>();
+  for (const s of sdks) {
+    const category = s.category || "dev";
+    const items = groups.get(category);
+    if (items) items.push(s);
+    else groups.set(category, [s]);
+  }
 
   async function toggle(name: string, enabled: boolean) {
     const res = await api.toggleSdk(name, enabled);
@@ -82,7 +88,16 @@ export function SdksPage() {
             </EmptyHeader>
           </Empty>
         ) : (
-          sdks.map((s) => <SdkItem key={s.name} sdk={s} onToggle={toggle} />)
+          Array.from(groups, ([category, items]) => (
+            <section key={category} className="pt-4">
+              <h3 className="text-muted-foreground m-0 pb-1 text-xs font-medium">{category}</h3>
+              <div>
+                {items.map((s) => (
+                  <SdkItem key={s.name} sdk={s} onToggle={toggle} />
+                ))}
+              </div>
+            </section>
+          ))
         )}
       </div>
     </>

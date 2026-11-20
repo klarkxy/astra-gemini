@@ -130,7 +130,7 @@ export function upsertProject(configPath, projectId, entry) {
   cfg[projectId] = {
     root: entry.root.trim(),
     mode,
-    sdks: entry.sdks === "*" ? "*" : Array.isArray(entry.sdks) ? entry.sdks : ["git", "pnpm", "npm", "python", "http", "fs_read"],
+    sdks: entry.sdks === "*" ? "*" : Array.isArray(entry.sdks) ? entry.sdks : ["git", "pnpm", "npm", "python", "cargo", "go", "http", "fs_read"],
     ...(Array.isArray(entry.allowedScripts) && entry.allowedScripts.length > 0 ? { allowedScripts: entry.allowedScripts } : {}),
     ...(Array.isArray(entry.deny) && entry.deny.length > 0 ? { deny: entry.deny } : {}),
     description: typeof entry.description === "string" ? entry.description.trim() : ""
@@ -155,7 +155,7 @@ export function listProjects(configPath, { includeRoot = false } = {}) {
     project: id,
     ...(includeRoot ? { root: entry.root || "" } : {}),
     mode: entry.mode || "direct",
-    sdks: entry.sdks ?? ["git", "pnpm", "npm", "python", "http", "fs_read"],
+    sdks: entry.sdks ?? ["git", "pnpm", "npm", "python", "cargo", "go", "http", "fs_read"],
     allowedScripts: Array.isArray(entry.allowedScripts) ? entry.allowedScripts : null,
     exists: Boolean(entry.root && fs.existsSync(entry.root)),
     description: entry.description || ""
@@ -183,7 +183,7 @@ export function getProject(configPath, projectId) {
     id: projectId,
     root: path.resolve(entry.root),
     mode,
-    sdks: entry.sdks ?? ["git", "pnpm", "npm", "python", "http", "fs_read"],
+    sdks: entry.sdks ?? ["git", "pnpm", "npm", "python", "cargo", "go", "http", "fs_read"],
     deny: Array.isArray(entry.deny) ? entry.deny : [],
     allowedScripts: Array.isArray(entry.allowedScripts) ? entry.allowedScripts : null,
     description: entry.description || ""

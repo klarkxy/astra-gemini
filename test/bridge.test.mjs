@@ -17,6 +17,11 @@ import { loadIdentity } from "../src/identity.mjs";
 import { openChannel } from "../src/secure-channel.mjs";
 import { createRendezvousServer } from "../src/rendezvous.mjs";
 import { createUpnpManager } from "../src/upnp.mjs";
+import { writeSecretFile } from "../src/secure-file.mjs";
+import { createSdk as createCargoSdk } from "../sdks/global/cargo.mjs";
+import { createSdk as createGoSdk } from "../sdks/global/go.mjs";
+import { createSdk as createNpmSdk } from "../sdks/global/npm.mjs";
+import { createSdk as createGitSdk } from "../sdks/global/git.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -105,7 +110,7 @@ async function waitUntil(fn, timeoutMs = 4000) {
   return false;
 }
 
-test("Astra Gemini single-node: GUI firewall, SDK hot toggles, 7 dev SDKs, snapshot, patch+rollback", async () => {
+test("Astra Gemini single-node: GUI firewall, SDK hot toggles, 9 dev SDKs, snapshot, patch+rollback", async () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-single-"));
   const demoRepo = path.join(tmpBase, "demo-repo");
   const roRepo = path.join(tmpBase, "ro-repo");
@@ -152,7 +157,7 @@ test("Astra Gemini single-node: GUI firewall, SDK hot toggles, 7 dev SDKs, snaps
 
     await fetch(`${baseUrl}/api/sdks/toggle`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Astra-Admin": token },
       body: JSON.stringify({ name: "worktree", enabled: true })
     });
 
@@ -185,7 +190,7 @@ test("Astra Gemini single-node: GUI firewall, SDK hot toggles, 7 dev SDKs, snaps
 
     const rbRes = await fetch(`${baseUrl}/api/backups/rollback`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Astra-Admin": token },
       body: JSON.stringify({ project: "demo", backupId: applied.backupId })
     }).then((r) => r.json());
     assert.equal(rbRes.ok, true);
@@ -628,7 +633,10 @@ test("Astra Gemini nodeId TOFU binding: hijack rejected, admin reset allows re-b
     })).body.result.structuredContent;
     assert.ok(snap.files.some((f) => f.path === "app.js"));
 
-    const del = await fetch(`${parentUrl}/api/tree/children/kid`, { method: "DELETE" }).then((r) => r.json());
+    const del = await fetch(`${parentUrl}/api/tree/children/kid`, {
+      method: "DELETE",
+      headers: { "X-Astra-Admin": "p-tok" }
+    }).then((r) => r.json());
     assert.equal(del.ok, true);
     assert.equal(await waitUntil(kidOnline, 6000), true);
   } finally {
@@ -1045,7 +1053,7 @@ test("Astra Gemini OAuth: register rate limit + eviction protects tokened client
     }
     assert.deepEqual(statuses, [201, 201, 201, 201, 429]);
 
-    const list = await fetch(`${base}/api/oauth`).then((r) => r.json());
+    const list = await fetch(`${base}/api/oauth`, { headers: { "X-Astra-Admin": "dcr-tok" } }).then((r) => r.json());
     assert.equal(list.clients.length, 3);
     assert.ok(list.clients.some((c) => c.client_id === clientA));
 
@@ -1096,7 +1104,7 @@ test("Astra Gemini protocol handshake: version mismatch closed 1008, no auto-rec
     assert.match(up.lastError, /protocol version mismatch: parent=1 child=99/);
 
     await new Promise((r) => setTimeout(r, 3000));
-    const st = await fetch(`${parentUrl}/api/status`).then((r) => r.json());
+    const st = await fetch(`${parentUrl}/api/status`, { headers: { "X-Astra-Admin": "pt" } }).then((r) => r.json());
     const rejects = (st.logs || []).filter(
       (l) => l.event === "节点被拒" && String(l.detail || "").includes("协议版本不匹配")
     );
@@ -1133,7 +1141,7 @@ test("Astra Gemini revert: any .. ref rejected and grant API gone", async () => 
     }
     const grant = await fetch(`${baseUrl}/api/tree/children/x/grant`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Astra-Admin": "t" },
       body: JSON.stringify({ canCallTree: true })
     });
     assert.equal(grant.status, 404);
@@ -1192,8 +1200,10 @@ async function rpcRemote(baseUrl, target, token, method, params = {}) {
   return { status: res.status, body: await res.json().catch(() => null) };
 }
 
-async function remoteStatus(baseUrl) {
-  return fetch(`${baseUrl}/api/remote`).then((r) => r.json());
+async function remoteStatus(node) {
+  const baseUrl = typeof node === "string" ? node : node.baseUrl;
+  const headers = node && node.adminKey ? { "X-Astra-Admin": node.adminKey } : {};
+  return fetch(`${baseUrl}/api/remote`, { headers }).then((r) => r.json());
 }
 
 async function startRemoteNode(tmpBase, name, {
@@ -1222,13 +1232,13 @@ async function startRemoteNode(tmpBase, name, {
     heartbeatIntervalMs: 200
   });
   await listenOn(server);
-  return { server, dir, baseUrl: `http://127.0.0.1:${server.address().port}` };
+  return { server, dir, baseUrl: `http://127.0.0.1:${server.address().port}`, adminKey: authToken || "" };
 }
 
-async function waitRvConnected(...baseUrls) {
-  for (const base of baseUrls) {
-    const ok = await waitUntil(async () => (await remoteStatus(base)).rendezvous?.connected === true, 8000);
-    assert.equal(ok, true, `rendezvous not connected on ${base}`);
+async function waitRvConnected(...nodes) {
+  for (const n of nodes) {
+    const ok = await waitUntil(async () => (await remoteStatus(n)).rendezvous?.connected === true, 8000);
+    assert.equal(ok, true, `rendezvous not connected on ${typeof n === "string" ? n : n.baseUrl}`);
   }
 }
 
@@ -1384,11 +1394,11 @@ test("remote direct: A proxies /remote/<addr>/mcp to B over P2P mutual TLS", asy
   });
 
   try {
-    const statA = await remoteStatus(A.baseUrl);
-    const statB = await remoteStatus(B.baseUrl);
+    const statA = await remoteStatus(A);
+    const statB = await remoteStatus(B);
     aCands = [`127.0.0.1:${statA.p2p.port}`];
     bCands = [`127.0.0.1:${statB.p2p.port}`];
-    await waitRvConnected(A.baseUrl, B.baseUrl);
+    await waitRvConnected(A, B);
 
     const list = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
     assert.equal(list.status, 200);
@@ -1403,7 +1413,7 @@ test("remote direct: A proxies /remote/<addr>/mcp to B over P2P mutual TLS", asy
     assert.notEqual(snap.body.result.isError, true);
     assert.match(JSON.stringify(snap.body.result), /app\.js/);
 
-    const statA2 = await remoteStatus(A.baseUrl);
+    const statA2 = await remoteStatus(A);
     assert.equal(statA2.channels.length >= 1, true);
     assert.equal(statA2.channels[0].mode, "direct");
     assert.equal(statA2.channels[0].peer, statB.address);
@@ -1417,12 +1427,12 @@ test("remote direct: A proxies /remote/<addr>/mcp to B over P2P mutual TLS", asy
     ]);
     assert.equal(p1.status, 200);
     assert.equal(p2.status, 200);
-    const statA3 = await remoteStatus(A.baseUrl);
+    const statA3 = await remoteStatus(A);
     assert.equal(statA3.channels.filter((c) => c.direction === "out" && c.peer === statB.address).length, 1);
 
     const reverse = await rpcRemote(B.baseUrl, statA.address, "tA", "tools/list");
     assert.equal(reverse.status, 200);
-    const statB2 = await remoteStatus(B.baseUrl);
+    const statB2 = await remoteStatus(B);
     assert.equal(
       statB2.channels.filter((c) => c.direction === "out" && c.peer === statA.address).length,
       1
@@ -1457,13 +1467,13 @@ test("remote relay fallback: ciphertext-only bytes over rendezvous when direct f
   });
 
   try {
-    const statB = await remoteStatus(B.baseUrl);
-    await waitRvConnected(A.baseUrl, B.baseUrl);
+    const statB = await remoteStatus(B);
+    await waitRvConnected(A, B);
 
     const list = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
     assert.equal(list.status, 200);
 
-    const statA2 = await remoteStatus(A.baseUrl);
+    const statA2 = await remoteStatus(A);
     assert.equal(statA2.channels.length >= 1, true);
     assert.equal(statA2.channels[0].mode, "relay");
 
@@ -1498,12 +1508,12 @@ test("remote aliases, unknown target 404, offline target 502", async () => {
   });
 
   try {
-    const statB = await remoteStatus(B.baseUrl);
-    await waitRvConnected(A.baseUrl, B.baseUrl);
+    const statB = await remoteStatus(B);
+    await waitRvConnected(A, B);
 
     const add = await fetch(`${A.baseUrl}/api/remote/aliases`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Astra-Admin": "tA" },
       body: JSON.stringify({ alias: "bb", address: statB.address })
     }).then((r) => r.json());
     assert.equal(add.ok, true);
@@ -1540,12 +1550,12 @@ test("remote remoteAllowFrom: B rejects A not on allowlist", async () => {
   });
 
   try {
-    const statB = await remoteStatus(B.baseUrl);
-    await waitRvConnected(A.baseUrl, B.baseUrl);
+    const statB = await remoteStatus(B);
+    await waitRvConnected(A, B);
 
     const allow = await fetch(`${B.baseUrl}/api/remote/allow`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Astra-Admin": "tB" },
       body: JSON.stringify({ addresses: [`ag1-${"z".repeat(32)}`] })
     }).then((r) => r.json());
     assert.equal(allow.ok, true);
@@ -1567,7 +1577,7 @@ test("remote p2p preamble: garbage and unknown sid closed before TLS", async () 
     rvUrl: "", rvToken: "", authToken: "tB", joinToken: "jB", candidates: () => []
   });
   try {
-    const statB = await remoteStatus(B.baseUrl);
+    const statB = await remoteStatus(B);
     const p2pPort = statB.p2p.port;
     assert.ok(p2pPort > 0);
 
@@ -1669,8 +1679,8 @@ test("remote auth guard: authMode none node rejects remote channel requests with
     rvUrl, rvToken: "rvt", joinToken: "jB", candidates: () => [], authMode: "none"
   });
   try {
-    const statB = await remoteStatus(B.baseUrl);
-    await waitRvConnected(A.baseUrl, B.baseUrl);
+    const statB = await remoteStatus(B);
+    await waitRvConnected(A, B);
     for (const token of [null, "anything"]) {
       const res = await rpcRemote(A.baseUrl, statB.address, token, "tools/list");
       assert.equal(res.status, 403);
@@ -1696,12 +1706,12 @@ test("remote idle: channel closes after channelIdleMs despite ping/pong traffic"
   const A = await startRemoteNode(tmpBase, "nodeA", { ...opts, authToken: "tA", joinToken: "jA" });
   const B = await startRemoteNode(tmpBase, "nodeB", { ...opts, authToken: "tB", joinToken: "jB" });
   try {
-    const statB = await remoteStatus(B.baseUrl);
-    await waitRvConnected(A.baseUrl, B.baseUrl);
+    const statB = await remoteStatus(B);
+    await waitRvConnected(A, B);
     const res = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
     assert.equal(res.status, 200);
-    assert.equal((await remoteStatus(A.baseUrl)).channels.length >= 1, true);
-    const closed = await waitUntil(async () => (await remoteStatus(A.baseUrl)).channels.length === 0, 5000);
+    assert.equal((await remoteStatus(A)).channels.length >= 1, true);
+    const closed = await waitUntil(async () => (await remoteStatus(A)).channels.length === 0, 5000);
     assert.equal(closed, true, "idle channel was not closed");
   } finally {
     A.server.close();
@@ -1787,6 +1797,241 @@ test("rendezvous relay: duplicate role join and wrong key rejected with 403", as
     nodeB.ws.close(1000, "done");
   } finally {
     rv.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("cargo SDK: whitelist rejection, package validation, missing manifest, real cargo check", (t) => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-cargo-"));
+  try {
+    const sdk = createCargoSdk({ bridgeRoot: tmpBase, project: { root: tmpBase, deny: [] } });
+    assert.equal(sdk.run("install").ok, false);
+    assert.equal(sdk.run("run").ok, false);
+    assert.equal(sdk.run("check").ok, false); // 无 Cargo.toml
+
+    fs.writeFileSync(
+      path.join(tmpBase, "Cargo.toml"),
+      '[package]\nname = "tiny"\nversion = "0.1.0"\nedition = "2021"\n',
+      "utf8"
+    );
+    fs.mkdirSync(path.join(tmpBase, "src"));
+    fs.writeFileSync(path.join(tmpBase, "src", "lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n", "utf8");
+
+    assert.equal(sdk.run("check", { package: "-x" }).ok, false);
+    assert.equal(sdk.run("check", { package: "a;b" }).ok, false);
+
+    const hasCargo = spawnSync("cargo", ["--version"], { encoding: "utf8" });
+    if (hasCargo.error || hasCargo.status !== 0) {
+      t.skip("cargo toolchain unavailable");
+      return;
+    }
+    const info = sdk.info();
+    assert.equal(info.ok, true);
+    assert.equal(info.hasManifest, true);
+    const res = sdk.run("check");
+    assert.equal(res.ok, true, res.error || res.tail);
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("go SDK: whitelist rejection, pkg/run validation, missing go.mod, real go vet", (t) => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-go-"));
+  try {
+    const sdk = createGoSdk({ bridgeRoot: tmpBase, project: { root: tmpBase, deny: [] } });
+    assert.equal(sdk.run("install").ok, false);
+    assert.equal(sdk.run("run").ok, false);
+    assert.equal(sdk.run("vet").ok, false); // 无 go.mod
+
+    fs.writeFileSync(path.join(tmpBase, "go.mod"), "module example.com/tiny\n\ngo 1.22\n", "utf8");
+    fs.writeFileSync(path.join(tmpBase, "main.go"), "package main\n\nfunc main() {}\n", "utf8");
+
+    assert.equal(sdk.run("vet", { pkg: "-x" }).ok, false);
+    assert.equal(sdk.run("vet", { pkg: "a;b" }).ok, false);
+    assert.equal(sdk.run("build", { run: "TestX" }).ok, false); // run 仅限 test
+    assert.equal(sdk.run("test", { run: "-x" }).ok, false);
+    assert.equal(sdk.run("test", { run: "a;b" }).ok, false);
+
+    const hasGo = spawnSync("go", ["version"], { encoding: "utf8" });
+    if (hasGo.error || hasGo.status !== 0) {
+      t.skip("go toolchain unavailable");
+      return;
+    }
+    const info = sdk.info();
+    assert.equal(info.ok, true);
+    assert.equal(info.module, "example.com/tiny");
+    const res = sdk.run("vet", { pkg: "./..." });
+    assert.equal(res.ok, true, res.error || res.tail);
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("npm SDK: manager auto-detect via packageManager field and lockfiles", () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-pm-"));
+  try {
+    const pkg = { name: "demo", scripts: { test: "node -e 1" } };
+    const write = (obj) => fs.writeFileSync(path.join(tmpBase, "package.json"), JSON.stringify(obj), "utf8");
+    const make = () =>
+      createNpmSdk({ bridgeRoot: tmpBase, project: { root: tmpBase, deny: [], allowedScripts: ["test"] } });
+
+    write(pkg);
+    fs.writeFileSync(path.join(tmpBase, "yarn.lock"), "", "utf8");
+    assert.equal(make().listScripts().manager, "yarn");
+
+    write({ ...pkg, packageManager: "bun@1.1.0" });
+    assert.equal(make().listScripts().manager, "bun"); // packageManager 优先于 lockfile
+
+    fs.rmSync(path.join(tmpBase, "yarn.lock"));
+    assert.equal(make().listScripts().manager, "bun");
+
+    write(pkg);
+    assert.equal(make().listScripts().manager, "npm");
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("git SDK: diff hides denied files, show/blame enforce deny and validate args", () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-gitsdk-"));
+  try {
+    const repo = path.join(tmpBase, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+    spawnSync("git", ["init"], { cwd: repo });
+    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+    spawnSync("git", ["config", "user.name", "Test User"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, ".env"), "SECRET_KEY=topsecret\n", "utf8");
+    fs.writeFileSync(path.join(repo, "src.txt"), "line one\n", "utf8");
+    spawnSync("git", ["add", "."], { cwd: repo });
+    spawnSync("git", ["commit", "-m", "init"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, ".env"), "SECRET_KEY=newsecret\n", "utf8");
+    fs.writeFileSync(path.join(repo, "src.txt"), "line one\nline two\n", "utf8");
+
+    const sdk = createGitSdk({ bridgeRoot: tmpBase, project: { root: repo, deny: [], mode: "direct" } });
+
+    const d = sdk.diff();
+    assert.equal(d.ok, true);
+    assert.ok(!d.diff.includes("newsecret"), "diff leaked denied .env content");
+    assert.ok(d.diff.includes("line two"));
+    assert.ok(d.hiddenCount >= 1);
+
+    const stat = sdk.diff({ statOnly: true });
+    assert.equal(stat.ok, true);
+    assert.ok(!stat.diff.includes(".env"), "stat diff leaked denied .env name");
+    assert.ok(stat.hiddenCount >= 1);
+
+    assert.equal(sdk.show("--output=x").ok, false);
+    assert.equal(sdk.show("HEAD", ".env").ok, false);
+    assert.equal(sdk.show("HEAD", "../outside").ok, false);
+    const sh = sdk.show("HEAD", "src.txt");
+    assert.equal(sh.ok, true);
+    assert.match(sh.content, /line one/);
+    const headStat = sdk.show("HEAD");
+    assert.equal(headStat.ok, true);
+    assert.match(headStat.stat, /src\.txt/);
+
+    const bl = sdk.blame("src.txt");
+    assert.equal(bl.ok, true);
+    assert.ok(Array.isArray(bl.lines) && bl.lines.length >= 1);
+    assert.equal(sdk.blame(".env").ok, false);
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("admin API key: /api/* requires X-Astra-Admin, /ui exempt, client-token fallback", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-adminkey-"));
+  try {
+    const bridgeDir = makeTempBridgeRoot(tmpBase, "bridge");
+    fs.writeFileSync(path.join(bridgeDir, "projects.json"), "{}", "utf8");
+    const server = createBridgeServer({
+      bridgeRoot: bridgeDir,
+      nodeId: "ak",
+      authMode: "bearer",
+      authToken: "client-tok",
+      adminKey: "admin-secret"
+    });
+    await listenOn(server);
+    const base = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const noKey = await fetch(`${base}/api/status`);
+      assert.equal(noKey.status, 401);
+      assert.equal((await noKey.json()).code, "admin_auth_required");
+      const wrong = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "nope" } });
+      assert.equal(wrong.status, 401);
+      const clientTok = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "client-tok" } });
+      assert.equal(clientTok.status, 401);
+      const good = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "admin-secret" } });
+      assert.equal(good.status, 200);
+      assert.equal((await fetch(`${base}/ui`)).status, 200);
+    } finally {
+      server.close();
+    }
+
+    const bridge2 = makeTempBridgeRoot(tmpBase, "bridge2");
+    fs.writeFileSync(path.join(bridge2, "projects.json"), "{}", "utf8");
+    const server2 = createBridgeServer({
+      bridgeRoot: bridge2,
+      nodeId: "ak2",
+      authMode: "bearer",
+      authToken: "client-tok2"
+    });
+    await listenOn(server2);
+    try {
+      const res = await fetch(`http://127.0.0.1:${server2.address().port}/api/status`, {
+        headers: { "X-Astra-Admin": "client-tok2" }
+      });
+      assert.equal(res.status, 200);
+    } finally {
+      server2.close();
+    }
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+function assertAclOwnerOnly(filePath) {
+  if (process.platform === "win32") {
+    const sys32 = path.join(process.env.SystemRoot || "C:\\Windows", "System32");
+    const out = spawnSync(path.join(sys32, "icacls.exe"), [filePath], { encoding: "utf8" }).stdout || "";
+    const who = spawnSync(path.join(sys32, "whoami.exe"), ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" }).stdout || "";
+    const firstLine = who.split(/\r?\n/).find((l) => l.trim()) || "";
+    const sid = String(firstLine.split(",")[1] || "").trim().replace(/^"|"$/g, "");
+    const account = String(firstLine.split(",")[0] || "").trim().replace(/^"|"$/g, "");
+    assert.ok(sid || account, `无法解析当前用户 SID: ${who}`);
+    const outLower = out.toLowerCase();
+    assert.ok(
+      outLower.includes(sid.toLowerCase()) || (account && outLower.includes(account.toLowerCase())),
+      `icacls 输出未包含当前用户 ${account || sid}: ${out}`
+    );
+    for (const line of out.split(/\r?\n/)) {
+      const ace = line.replace(filePath, "");
+      assert.ok(!/authenticated users|everyone|\busers\b/i.test(ace), `ACL 中不应出现其他主体: ${line}`);
+    }
+  } else {
+    assert.equal(fs.statSync(filePath).mode & 0o077, 0, `${filePath} 权限应仅属主可读写`);
+  }
+}
+
+test("secret file ACLs: writeSecretFile + startup hardenSecretFiles restrict to owner", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-acl-"));
+  try {
+    const fresh = path.join(tmpBase, "fresh-secret.txt");
+    writeSecretFile(fresh, "s3cr3t");
+    assert.equal(fs.readFileSync(fresh, "utf8"), "s3cr3t");
+    assertAclOwnerOnly(fresh);
+
+    const bridgeDir = makeTempBridgeRoot(tmpBase, "bridge");
+    fs.writeFileSync(path.join(bridgeDir, "projects.json"), "{}", "utf8");
+    const server = createBridgeServer({ bridgeRoot: bridgeDir, nodeId: "acl", authMode: "none" });
+    await listenOn(server);
+    try {
+      assertAclOwnerOnly(path.join(bridgeDir, "identity.json"));
+      assertAclOwnerOnly(path.join(bridgeDir, "settings.json"));
+    } finally {
+      server.close();
+    }
+  } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });
