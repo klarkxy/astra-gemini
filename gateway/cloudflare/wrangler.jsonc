@@ -1,0 +1,13 @@
+{
+  "name": "astra-gemini-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "kv_namespaces": [
+    { "binding": "OAUTH_KV", "id": "550272a22f264aa8be6b9cde7f1e5828" }
+  ],
+  "vars": {
+    "UPSTREAM_MCP_URL": "https://astra.klarkxy.xyz/mcp",
+    "PUBLIC_ORIGIN": ""
+  },
+  "observability": { "enabled": true }
+}

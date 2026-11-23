@@ -18,3 +18,8 @@ oauth-state.json
 identity.json
 notes/
 web/dist/
+docker/demo/dist/
+gateway/cloudflare/node_modules/
+gateway/cloudflare/.wrangler/
+gateway/cloudflare/.dev.vars
+deploy/local.json

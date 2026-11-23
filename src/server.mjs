@@ -11,7 +11,6 @@ import { execVerify, listGlobalSdkCatalog, listSdks } from "./sdk-loader.mjs";
 import { loadSettings, saveSettings } from "./settings.mjs";
 import { checkEnvironment, createTunnelManager } from "./tunnel.mjs";
 import { createTreeManager, PROTOCOL_VERSION } from "./tree.mjs";
-import { createOAuthServer } from "./oauth.mjs";
 import { loadIdentity } from "./identity.mjs";
 import { createRemoteManager } from "./remote.mjs";
 import { hardenSecretFiles, writeSecretFile } from "./secure-file.mjs";
@@ -22,6 +21,14 @@ const UI_HTML_PATH = path.join(__dirname, "ui.html");
 
 const MCP_PROTOCOL_VERSION = "2025-03-26";
 const SERVER_INFO = { name: "astra-gemini", version: "0.1.0" };
+const ADMIN_WINDOW_MS = 10 * 60 * 1000;
+const ADMIN_FAIL_LIMIT = 10;
+const PUBLIC_UI_HEADERS = {
+  "Content-Security-Policy": "frame-ancestors 'none'",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Cache-Control": "no-store"
+};
 
 const TOOLS = [
   {
@@ -203,13 +210,15 @@ export function createBridgeServer(options = {}) {
   );
   const port = Number(options.port || process.env.PORT || 3939);
   const authMode = options.authMode ?? process.env.AUTH_MODE ?? "bearer";
-  const authToken = options.authToken ?? process.env.ASTRA_TOKEN ?? process.env.KIMI_BRIDGE_TOKEN ?? "";
-  const joinToken = options.joinToken ?? process.env.ASTRA_JOIN_TOKEN ?? "";
-  const adminKey = (options.adminKey ?? process.env.ASTRA_ADMIN_KEY) || (authMode === "bearer" ? authToken : "");
-  const fixedNodeId = options.nodeId || process.env.ASTRA_NODE_ID || null;
+  let authToken = options.authToken ?? process.env.ASTRA_TOKEN ?? process.env.KIMI_BRIDGE_TOKEN ?? "";
+  let joinToken = options.joinToken ?? process.env.ASTRA_JOIN_TOKEN ?? "";
+  let adminKey = options.adminKey ?? process.env.ASTRA_ADMIN_KEY ?? "";
+  const fixedNodeId = options.nodeId || null;
   hardenSecretFiles(bridgeRoot);
   const startedAt = Date.now();
   const recentLogs = [];
+  const adminFailures = [];
+  let adminLockUntil = 0;
   const tunnel = createTunnelManager(port, () => loadSettings(bridgeRoot).tunnel);
 
   if (authMode === "bearer" && !authToken) {
@@ -274,15 +283,60 @@ export function createBridgeServer(options = {}) {
     }
   };
 
-  function getIssuer(req) {
+  function configuredPublicUrl() {
     const s = loadSettings(bridgeRoot);
     const configured =
       options.publicUrl ||
-      process.env.ASTRA_PUBLIC_URL ||
       s.publicUrl ||
+      process.env.ASTRA_PUBLIC_URL ||
       (s.tunnel && s.tunnel.mode === "named" ? s.tunnel.publicUrl : "") ||
       "";
-    if (configured) return configured.replace(/\/+$/, "");
+    return configured ? configured.replace(/\/+$/, "") : "";
+  }
+
+  // 公网控制台：options 优先，settings.publicConsole 次之，最后回退 ASTRA_PUBLIC_CONSOLE=1；
+  // 同时需已配置公网地址。
+  function publicConsoleUrl() {
+    const s = loadSettings(bridgeRoot);
+    const enabled =
+      options.publicConsole ??
+      (typeof s.publicConsole === "boolean" ? s.publicConsole : process.env.ASTRA_PUBLIC_CONSOLE === "1");
+    if (!enabled || authMode === "none") return null;
+    const pub = configuredPublicUrl();
+    if (!pub) return null;
+    try {
+      return new URL(pub);
+    } catch {
+      return null;
+    }
+  }
+
+  function effectiveAdminKey() {
+    return adminKey || (authMode === "bearer" ? authToken : "");
+  }
+
+  // 仅当密钥来自 bridgeRoot 下的文件（docker entrypoint / tray.ps1 注入）时才允许轮换；
+  // 由环境变量直接固定的值须改环境变量后重启。
+  const SECRET_ROTATION = {
+    client: { file: "token.txt", needsBearer: true, current: () => authToken, set: (v) => { authToken = v; } },
+    join: { file: "join-token.txt", needsBearer: false, current: () => joinToken, set: (v) => { joinToken = v; } },
+    admin: { file: "admin-key.txt", needsBearer: true, current: () => effectiveAdminKey(), set: (v) => { adminKey = v; } }
+  };
+
+  function secretRotatable(kind) {
+    const spec = SECRET_ROTATION[kind];
+    if (!spec) return false;
+    if (spec.needsBearer && authMode !== "bearer") return false;
+    try {
+      return fs.readFileSync(path.join(bridgeRoot, spec.file), "utf8").trim() === spec.current();
+    } catch {
+      return false;
+    }
+  }
+
+  function getPublicBase(req) {
+    const configured = configuredPublicUrl();
+    if (configured) return configured;
     const host = String(req?.headers?.host || "localhost");
     const fwd = String(req?.headers?.["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
     let proto = fwd === "http" || fwd === "https" ? fwd : null;
@@ -291,22 +345,12 @@ export function createBridgeServer(options = {}) {
     }
     if (!proto) proto = "http";
     const hostName = adminHostName(host).toLowerCase();
-    if (!warnedIssuerFallback && !["127.0.0.1", "localhost", "::1"].includes(hostName)) {
-      warnedIssuerFallback = true;
-      recordLog("未配置 publicUrl", "OAuth issuer 由请求 Host 推断，请在设置中配置公网地址");
+    if (!warnedPublicBaseFallback && !["127.0.0.1", "localhost", "::1"].includes(hostName)) {
+      warnedPublicBaseFallback = true;
+      recordLog("未配置 publicUrl", "对外地址由请求 Host 推断，请在设置中配置公网地址");
     }
     return `${proto}://${host}`;
   }
-
-  const oauth = createOAuthServer({
-    getIssuer,
-    statePath: path.join(bridgeRoot, "oauth-state.json"),
-    verifyPassword: (pw) => tokenEqual(authToken, pw),
-    maxClients: options.oauthMaxClients,
-    registerLimit: options.oauthRegisterLimit,
-    registerWindowMs: options.oauthRegisterWindowMs,
-    fetchClientMetadata: options.fetchClientMetadata
-  });
 
   function tokenEqual(expected, actual) {
     const a = Buffer.from(String(expected ?? ""), "utf8");
@@ -323,8 +367,7 @@ export function createBridgeServer(options = {}) {
     if (authMode === "none") return true;
     const token = bearerToken(req);
     if (!token) return false;
-    if (tokenEqual(authToken, token)) return true;
-    return oauth.isAccessTokenValid(token);
+    return tokenEqual(authToken, token);
   }
 
   function isJoinAuthorized(req) {
@@ -336,7 +379,7 @@ export function createBridgeServer(options = {}) {
 
   let serverRef = null;
   let warnedNoJoinToken = false;
-  let warnedIssuerFallback = false;
+  let warnedPublicBaseFallback = false;
 
   const tree = createTreeManager({
     getNodeId: () => fixedNodeId || loadSettings(bridgeRoot).nodeId,
@@ -379,7 +422,7 @@ export function createBridgeServer(options = {}) {
     });
     if (!isClientAuthorized({ headers })) {
       return respond(401, { error: "Unauthorized" }, {
-        "WWW-Authenticate": `Bearer resource_metadata="${getIssuer({ headers })}/.well-known/oauth-protected-resource/mcp"`
+        "WWW-Authenticate": `Bearer realm="astra-gemini"`
       });
     }
     let msg;
@@ -472,38 +515,41 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
-    if (url.pathname.startsWith("/.well-known/") || url.pathname.startsWith("/oauth/")) {
-      const handled = await oauth.handleRequest(req, res, url);
-      if (!handled) {
-        sendJson(req, res, 404, { error: "Not found." });
-      }
-      return;
-    }
-
     if (
       url.pathname === "/" ||
       url.pathname === "/ui" ||
       url.pathname.startsWith("/api/") ||
       url.pathname.startsWith("/remote/")
     ) {
-      if (!isDirectLocalhost(req)) {
-        sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截外部隧道请求。" });
-        return;
-      }
-
-      const hostHeader = String(req.headers.host || "");
-      const hostName = adminHostName(hostHeader).toLowerCase();
-      if (!["127.0.0.1", "localhost", "::1"].includes(hostName)) {
-        sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截非法 Host 请求。" });
-        return;
-      }
-      if (req.headers.origin !== undefined && req.headers.origin !== `http://${hostHeader}`) {
-        sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Origin 校验失败)。" });
-        return;
-      }
-      if (req.headers["sec-fetch-site"] === "cross-site") {
-        sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Sec-Fetch-Site: cross-site)。" });
-        return;
+      const localReq = isDirectLocalhost(req);
+      const isPublicReq = !localReq;
+      if (isPublicReq) {
+        const pubUrl = publicConsoleUrl();
+        const allowed =
+          pubUrl !== null &&
+          !url.pathname.startsWith("/remote/") &&
+          String(req.headers.host || "").toLowerCase() === pubUrl.host.toLowerCase() &&
+          (req.headers.origin === undefined || String(req.headers.origin) === pubUrl.origin) &&
+          req.headers["sec-fetch-site"] !== "cross-site";
+        if (!allowed) {
+          sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截外部隧道请求。" });
+          return;
+        }
+      } else {
+        const hostHeader = String(req.headers.host || "");
+        const hostName = adminHostName(hostHeader).toLowerCase();
+        if (!["127.0.0.1", "localhost", "::1"].includes(hostName)) {
+          sendJson(req, res, 403, { error: "管理控制台仅允许本机 (127.0.0.1) 访问，已拦截非法 Host 请求。" });
+          return;
+        }
+        if (req.headers.origin !== undefined && req.headers.origin !== `http://${hostHeader}`) {
+          sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Origin 校验失败)。" });
+          return;
+        }
+        if (req.headers["sec-fetch-site"] === "cross-site") {
+          sendJson(req, res, 403, { error: "管理控制台已拦截跨站请求 (Sec-Fetch-Site: cross-site)。" });
+          return;
+        }
       }
 
       if (url.pathname.startsWith("/remote/")) {
@@ -537,18 +583,40 @@ export function createBridgeServer(options = {}) {
           sendJson(req, res, 404, { error: "UI page not found." });
           return;
         }
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          ...(isPublicReq ? PUBLIC_UI_HEADERS : {})
+        });
         res.end(fs.readFileSync(UI_HTML_PATH, "utf8"));
         return;
       }
 
-      if (authMode !== "none" && !tokenEqual(adminKey, req.headers["x-astra-admin"])) {
-        sendJson(req, res, 401, {
-          ok: false,
-          code: "admin_auth_required",
-          error: "需要管理密钥：请从托盘菜单打开控制台，或粘贴 admin-key.txt 中的密钥。"
-        });
-        return;
+      if (authMode !== "none") {
+        if (isPublicReq && Date.now() < adminLockUntil) {
+          sendJson(req, res, 429, {
+            ok: false,
+            code: "admin_locked",
+            error: "管理密钥错误次数过多，请 10 分钟后再试。"
+          });
+          return;
+        }
+        if (!tokenEqual(effectiveAdminKey(), req.headers["x-astra-admin"])) {
+          if (isPublicReq && req.headers["x-astra-admin"] !== undefined) {
+            const now = Date.now();
+            adminFailures.push(now);
+            while (adminFailures.length && adminFailures[0] < now - ADMIN_WINDOW_MS) adminFailures.shift();
+            if (adminFailures.length > ADMIN_FAIL_LIMIT) {
+              adminFailures.length = 0;
+              adminLockUntil = now + ADMIN_WINDOW_MS;
+            }
+          }
+          sendJson(req, res, 401, {
+            ok: false,
+            code: "admin_auth_required",
+            error: "需要管理密钥：粘贴 admin-key.txt 中的密钥（Docker 部署在 /data/admin-key.txt）。"
+          });
+          return;
+        }
       }
 
       try {
@@ -573,7 +641,14 @@ export function createBridgeServer(options = {}) {
             authToken,
             joinToken,
             hasJoinToken: Boolean(joinToken) || authMode === "none",
-            publicUrl: getIssuer(req),
+            publicUrl: getPublicBase(req),
+            publicMcpUrl: configuredPublicUrl() ? `${configuredPublicUrl()}/mcp` : null,
+            publicConsole: Boolean(publicConsoleUrl()),
+            rotatable: {
+              client: secretRotatable("client"),
+              join: secretRotatable("join"),
+              admin: secretRotatable("admin")
+            },
             uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
             settings: safeSettings,
             projects: listProjects(projectsConfigPath, { includeRoot: true }),
@@ -583,6 +658,85 @@ export function createBridgeServer(options = {}) {
             tree: tree.getTreeStatus(),
             logs: recentLogs
           });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/secrets/rotate") {
+          const body = JSON.parse(await readBody(req));
+          const kind = String(body?.kind || "");
+          const spec = SECRET_ROTATION[kind];
+          if (!spec) {
+            sendJson(req, res, 400, { ok: false, error: "未知密钥类型，应为 client/join/admin。" });
+            return;
+          }
+          if (!secretRotatable(kind)) {
+            sendJson(req, res, 409, { ok: false, error: "该值由环境变量固定，请修改环境变量后重启。" });
+            return;
+          }
+          const value = crypto.randomBytes(32).toString("hex");
+          writeSecretFile(path.join(bridgeRoot, spec.file), value);
+          spec.set(value);
+          recordLog("密钥轮换", kind);
+          sendJson(req, res, 200, { ok: true, kind, value });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/gateway/check") {
+          const body = JSON.parse(await readBody(req));
+          const raw = typeof body?.url === "string" && body.url.trim()
+            ? body.url
+            : loadSettings(bridgeRoot).gatewayUrl || "";
+          const base = String(raw).trim().replace(/\/+$/, "").replace(/\/mcp$/i, "").replace(/\/+$/, "");
+          let parsed = null;
+          try {
+            parsed = base ? new URL(base) : null;
+          } catch {
+            parsed = null;
+          }
+          const isLocal = parsed && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+          if (!parsed || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLocal))) {
+            sendJson(req, res, 400, { ok: false, error: "网关地址无效：需 https:// 地址（仅本机测试可用 http://127.0.0.1）。" });
+            return;
+          }
+          const checks = [];
+          const gwFetch = (u, init = {}) => fetch(u, { ...init, redirect: "manual", signal: AbortSignal.timeout(8000) });
+          const push = (name, ok, detail) => checks.push({ name, ok, detail });
+          try {
+            const r = await gwFetch(`${base}/.well-known/oauth-authorization-server`);
+            if (r.status !== 200) {
+              push("授权服务发现", false, `HTTP ${r.status}`);
+            } else {
+              const doc = await r.json().catch(() => null);
+              const okMeta = doc && doc.authorization_endpoint && doc.token_endpoint;
+              push("授权服务发现", Boolean(okMeta), okMeta ? "HTTP 200，端点齐全" : "响应缺少 authorization_endpoint/token_endpoint");
+            }
+          } catch (err) {
+            push("授权服务发现", false, `网络错误：${err.message}`);
+          }
+          try {
+            const r = await gwFetch(`${base}/.well-known/oauth-protected-resource/mcp`);
+            if (r.status !== 200) {
+              push("受保护资源元数据", false, `HTTP ${r.status}`);
+            } else {
+              const doc = await r.json().catch(() => null);
+              const expected = `${base}/mcp`;
+              const okMeta = doc && doc.resource === expected;
+              push("受保护资源元数据", Boolean(okMeta), okMeta ? `HTTP 200，resource=${expected}` : `resource 不匹配：${doc?.resource ?? "(缺失)"}`);
+            }
+          } catch (err) {
+            push("受保护资源元数据", false, `网络错误：${err.message}`);
+          }
+          try {
+            const r = await gwFetch(`${base}/mcp`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
+            });
+            push("MCP 需鉴权", r.status === 401, r.status === 401 ? "HTTP 401" : `期望 401，实际 HTTP ${r.status}`);
+          } catch (err) {
+            push("MCP 需鉴权", false, `网络错误：${err.message}`);
+          }
+          sendJson(req, res, 200, { ok: checks.every((c) => c.ok), base, checks });
           return;
         }
 
@@ -639,24 +793,6 @@ export function createBridgeServer(options = {}) {
           return;
         }
 
-        if (req.method === "GET" && url.pathname === "/api/oauth") {
-          sendJson(req, res, 200, { ok: true, issuer: getIssuer(req), clients: oauth.listClients() });
-          return;
-        }
-
-        if (req.method === "POST" && url.pathname === "/api/oauth/revoke-all") {
-          let body = {};
-          try {
-            body = JSON.parse(await readBody(req));
-          } catch {
-            body = {};
-          }
-          oauth.revokeAll({ dropClients: Boolean(body?.dropClients) });
-          recordLog("OAuth 撤销", body?.dropClients ? "已清空全部令牌与客户端" : "已撤销全部访问令牌");
-          sendJson(req, res, 200, { ok: true });
-          return;
-        }
-
         if (req.method === "POST" && url.pathname === "/api/tunnel/config") {
           const body = JSON.parse(await readBody(req));
           const mode = body.mode === "named" ? "named" : "quick";
@@ -681,6 +817,8 @@ export function createBridgeServer(options = {}) {
           if (typeof body.directEnabled === "boolean") patch.directEnabled = body.directEnabled;
           if (typeof body.advertiseLan === "boolean") patch.advertiseLan = body.advertiseLan;
           if (typeof body.publicUrl === "string") patch.publicUrl = body.publicUrl.trim();
+          if (typeof body.publicConsole === "boolean") patch.publicConsole = body.publicConsole;
+          if (typeof body.gatewayUrl === "string") patch.gatewayUrl = body.gatewayUrl.trim();
           if (body.p2p && typeof body.p2p === "object") {
             const p2p = { ...(loadSettings(bridgeRoot).p2p || {}) };
             if (typeof body.p2p.enabled === "boolean") p2p.enabled = body.p2p.enabled;
@@ -804,7 +942,7 @@ export function createBridgeServer(options = {}) {
 
     if (!isClientAuthorized(req)) {
       sendJson(req, res, 401, { error: "Unauthorized" }, {
-        "WWW-Authenticate": `Bearer resource_metadata="${getIssuer(req)}/.well-known/oauth-protected-resource/mcp"`
+        "WWW-Authenticate": `Bearer realm="astra-gemini"`
       });
       return;
     }

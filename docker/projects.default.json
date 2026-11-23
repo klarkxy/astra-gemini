@@ -1,0 +1,9 @@
+{
+  "demo": {
+    "root": "/workspace/demo",
+    "mode": "direct",
+    "sdks": ["npm", "fs_read", "git"],
+    "allowedScripts": ["build", "test"],
+    "description": "Docker demo project"
+  }
+}

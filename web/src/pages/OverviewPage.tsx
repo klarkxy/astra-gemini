@@ -5,8 +5,7 @@ import {
   FolderCode,
   History,
   Network,
-  Puzzle,
-  Users
+  Puzzle
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useStatus } from "@/lib/status";
@@ -23,7 +22,7 @@ interface SummaryRow {
 }
 
 export function OverviewPage({ go }: { go: (p: PageId) => void }) {
-  const { status, oauthClients } = useStatus();
+  const { status } = useStatus();
 
   if (!status) {
     return (
@@ -63,8 +62,7 @@ export function OverviewPage({ go }: { go: (p: PageId) => void }) {
     { icon: Puzzle, text: `SDK 已启用 ${enabled}/${sdks.length}`, page: "sdks" },
     { icon: Network, text: `子节点 在线 ${online}/${children.length}`, page: "tree" },
     { icon: ArrowUpToLine, text: `上游 ${upText}`, warn: !!up.enabled && !up.connected, page: "tree" },
-    { icon: History, text: `备份 ${(status.backups || []).length} 份`, page: "backups" },
-    { icon: Users, text: `OAuth 客户端 ${oauthClients.length} 个`, page: "env" }
+    { icon: History, text: `备份 ${(status.backups || []).length} 份`, page: "backups" }
   ];
 
   return (

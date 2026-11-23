@@ -1,6 +1,6 @@
 import type {
   EnvItem,
-  OauthClient,
+  GatewayCheckResult,
   RemoteStatus,
   StatusResponse
 } from "./types";
@@ -21,15 +21,38 @@ if (hashKey) {
 
 export function getAdminKey(): string {
   try {
-    return sessionStorage.getItem(ADMIN_KEY_STORAGE) || "";
+    return sessionStorage.getItem(ADMIN_KEY_STORAGE) || localStorage.getItem(ADMIN_KEY_STORAGE) || "";
   } catch {
     return "";
   }
 }
 
-export function setAdminKey(key: string) {
+export function adminKeyRemembered(): boolean {
   try {
-    sessionStorage.setItem(ADMIN_KEY_STORAGE, key);
+    return Boolean(localStorage.getItem(ADMIN_KEY_STORAGE));
+  } catch {
+    return false;
+  }
+}
+
+export function setAdminKey(key: string, remember = false) {
+  try {
+    if (remember) {
+      localStorage.setItem(ADMIN_KEY_STORAGE, key);
+      sessionStorage.removeItem(ADMIN_KEY_STORAGE);
+    } else {
+      sessionStorage.setItem(ADMIN_KEY_STORAGE, key);
+      localStorage.removeItem(ADMIN_KEY_STORAGE);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function clearAdminKey() {
+  try {
+    sessionStorage.removeItem(ADMIN_KEY_STORAGE);
+    localStorage.removeItem(ADMIN_KEY_STORAGE);
   } catch {
     // ignore
   }
@@ -52,6 +75,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   }
   const data = (await res.json().catch(() => null)) as ({ ok?: boolean; error?: string } & Record<string, unknown>) | null;
   if (data == null) return { ok: false, error: `HTTP ${res.status}` } as T;
+  if (data.code === "admin_auth_required") clearAdminKey();
   if (!res.ok) return { ...data, ok: false, error: data.error || `HTTP ${res.status}` } as T;
   return data as T;
 }
@@ -59,7 +83,6 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
 export const api = {
   status: () => req<StatusResponse>("GET", "/api/status"),
   env: () => req<{ ok: boolean; env: Record<string, EnvItem> }>("GET", "/api/env"),
-  oauth: () => req<{ ok: boolean; clients?: OauthClient[] }>("GET", "/api/oauth"),
   remote: () => req<RemoteStatus>("GET", "/api/remote"),
   toggleSdk: (name: string, enabled: boolean) =>
     req<ApiResult>("POST", "/api/sdks/toggle", { name, enabled }),
@@ -84,7 +107,10 @@ export const api = {
     req<ApiResult>("POST", "/api/tunnel/config", body),
   saveSettings: (body: Record<string, unknown>) =>
     req<ApiResult>("POST", "/api/settings", body),
-  revokeAllOauth: () => req<ApiResult>("POST", "/api/oauth/revoke-all", {}),
+  rotateSecret: (kind: "client" | "join" | "admin") =>
+    req<ApiResult & { kind?: string; value?: string }>("POST", "/api/secrets/rotate", { kind }),
+  checkGateway: (url?: string) =>
+    req<GatewayCheckResult>("POST", "/api/gateway/check", url ? { url } : {}),
   saveRendezvous: (body: { enabled: boolean; url: string; token?: string }) =>
     req<ApiResult>("POST", "/api/rendezvous", body),
   saveRemoteAlias: (alias: string, address: string | null) =>

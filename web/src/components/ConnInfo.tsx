@@ -39,6 +39,7 @@ export function ConnInfo() {
   }
 
   const t = status.tunnel || {};
+  const publicMcp = status.publicMcpUrl || "";
   const tunnelText = t.running
     ? t.mcpUrl || "正在获取公网地址，请稍等几秒..."
     : t.lastError
@@ -71,9 +72,9 @@ export function ConnInfo() {
 
   return (
     <div className="border-border grid grid-cols-[repeat(auto-fit,minmax(min(100%,280px),1fr))] gap-x-7 gap-y-4 border-b pb-5 pt-3">
-      <FieldRow label="MCP 地址（AI 客户端连接入口）">
-        <MonoBox>{status.localMcpUrl}</MonoBox>
-        <CopyButton text={status.localMcpUrl} message="已复制本机 MCP 地址" />
+      <FieldRow label={publicMcp ? "公网 MCP 地址" : "MCP 地址（AI 客户端连接入口）"}>
+        <MonoBox>{publicMcp || status.localMcpUrl}</MonoBox>
+        <CopyButton text={publicMcp || status.localMcpUrl} message="已复制 MCP 地址" />
       </FieldRow>
 
       <FieldRow label="客户端 Token">
@@ -86,6 +87,7 @@ export function ConnInfo() {
         />
       </FieldRow>
 
+      {!publicMcp && (
       <div>
         <FieldRow label="公网隧道（Cloudflare Tunnel）">
           <MonoBox title={tunnelText}>{tunnelText}</MonoBox>
@@ -141,6 +143,7 @@ export function ConnInfo() {
           </CollapsibleContent>
         </Collapsible>
       </div>
+      )}
     </div>
   );
 }

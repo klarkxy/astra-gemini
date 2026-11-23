@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>扫雷</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <h1>扫雷 Minesweeper</h1>
+  <div class="hud">
+    <div id="counter" class="num"></div>
+    <button id="face" title="重开">🙂</button>
+    <div id="timer" class="num">0</div>
+  </div>
+  <div class="hud">
+    <select id="level">
+      <option value="easy">初级 9×9</option>
+      <option value="medium">中级 16×16</option>
+      <option value="hard">高级 16×30</option>
+    </select>
+  </div>
+  <div id="board"></div>
+  <p class="hint">左键翻开 · 右键插旗 · 点笑脸重开</p>
+  <script type="module" src="game.js"></script>
+</body>
+</html>

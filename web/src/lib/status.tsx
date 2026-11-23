@@ -1,11 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { api } from "./api";
-import type { OauthClient, PageId, RemoteStatus, StatusResponse } from "./types";
+import type { PageId, RemoteStatus, StatusResponse } from "./types";
 
 interface StatusCtx {
   status: StatusResponse | null;
   remote: RemoteStatus | null;
-  oauthClients: OauthClient[];
   error: string | null;
   locked: boolean;
   refresh: () => Promise<void>;
@@ -16,13 +15,13 @@ const Ctx = createContext<StatusCtx | null>(null);
 export function StatusProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [remote, setRemote] = useState<RemoteStatus | null>(null);
-  const [oauthClients, setOauthClients] = useState<OauthClient[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [locked, setLocked] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [s, o, r] = await Promise.all([api.status(), api.oauth(), api.remote()]);
-    if ((s as (StatusResponse & { code?: string }) | null)?.code === "admin_auth_required") {
+    const [s, r] = await Promise.all([api.status(), api.remote()]);
+    const code = (s as (StatusResponse & { code?: string }) | null)?.code;
+    if (code === "admin_auth_required" || code === "admin_locked") {
       setLocked(true);
       setError(s?.error || "需要管理密钥");
     } else if (s?.ok) {
@@ -32,7 +31,6 @@ export function StatusProvider({ children }: { children: ReactNode }) {
     } else {
       setError(s?.error || "状态获取失败");
     }
-    if (o?.ok) setOauthClients(o.clients || []);
     if (r && r.address) setRemote(r);
   }, []);
 
@@ -51,7 +49,7 @@ export function StatusProvider({ children }: { children: ReactNode }) {
     };
   }, [refresh]);
 
-  return <Ctx.Provider value={{ status, remote, oauthClients, error, locked, refresh }}>{children}</Ctx.Provider>;
+  return <Ctx.Provider value={{ status, remote, error, locked, refresh }}>{children}</Ctx.Provider>;
 }
 
 export function useStatus(): StatusCtx {
@@ -60,7 +58,7 @@ export function useStatus(): StatusCtx {
   return c;
 }
 
-const PAGES: PageId[] = ["overview", "sdks", "projects", "tree", "backups", "env"];
+const PAGES: PageId[] = ["overview", "connect", "sdks", "projects", "tree", "backups", "env"];
 
 export function pageFromHash(hash: string): PageId {
   const h = hash.replace(/^#/, "");

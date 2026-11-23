@@ -1,0 +1,25 @@
+services:
+  astra-gemini:
+    image: astra-gemini:local
+    build: .
+    container_name: astra-gemini
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${ASTRA_HOST_PORT:-3939}:3939"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ASTRA_NODE_ID: ${ASTRA_NODE_ID:-}
+      ASTRA_PUBLIC_URL: ${ASTRA_PUBLIC_URL:-}
+      ASTRA_UPSTREAM_URL: ${ASTRA_UPSTREAM_URL:-}
+      ASTRA_UPSTREAM_TOKEN: ${ASTRA_UPSTREAM_TOKEN:-}
+      AUTH_MODE: ${AUTH_MODE:-bearer}
+      ASTRA_PUBLIC_CONSOLE: ${ASTRA_PUBLIC_CONSOLE:-}
+    volumes:
+      - astra-data:/data
+      - ./docker/demo:/workspace/demo
+      - ./games/minesweeper:/workspace/minesweeper
+
+volumes:
+  astra-data:

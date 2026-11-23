@@ -119,7 +119,7 @@ $itemCopyUrl.Add_Click({
 })
 $itemCopyToken.Add_Click({
   [System.Windows.Forms.Clipboard]::SetText($token)
-  $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制客户端 Token（/mcp Bearer 与 OAuth 授权页口令）", [System.Windows.Forms.ToolTipIcon]::Info)
+  $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制客户端 Token（/mcp Bearer 凭据）", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $itemCopyJoin.Add_Click({
   [System.Windows.Forms.Clipboard]::SetText($joinToken)

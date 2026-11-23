@@ -8,8 +8,7 @@ export const SECRET_FILES = [
   "admin-key.txt",
   "identity.json",
   "settings.json",
-  "nodes.json",
-  "oauth-state.json"
+  "nodes.json"
 ];
 
 let cachedSid;

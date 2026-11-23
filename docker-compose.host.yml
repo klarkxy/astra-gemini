@@ -1,0 +1,10 @@
+# Linux VPS 覆盖：host 网络 + 仅绑定 127.0.0.1
+# 用法：docker compose -f docker-compose.yml -f docker-compose.host.yml up -d
+# 控制台经 SSH 隧道访问：ssh -L 3939:127.0.0.1:3939 <host> → http://127.0.0.1:3939/ui
+services:
+  astra-gemini:
+    network_mode: host
+    ports: !reset []
+    environment:
+      HOST: 127.0.0.1
+      PORT: ${ASTRA_HOST_PORT:-3939}

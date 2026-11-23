@@ -256,6 +256,7 @@ export function TreePage() {
   const [tUpToken, setTUpToken] = useState("");
   const [swDirect, setSwDirect] = useState(true);
   const [swLan, setSwLan] = useState(true);
+  const [swPubCon, setSwPubCon] = useState(false);
   const [sPublicUrl, setSPublicUrl] = useState("");
   const [showJoinToken, setShowJoinToken] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
@@ -269,6 +270,7 @@ export function TreePage() {
       setTUpToken(s.upstream?.token || "");
       setSwDirect(s.directEnabled !== false);
       setSwLan(s.advertiseLan !== false);
+      setSwPubCon(typeof s.publicConsole === "boolean" ? s.publicConsole : Boolean(status.publicConsole));
       setSPublicUrl(s.publicUrl || "");
       treeSeeded.current = true;
     }
@@ -324,7 +326,8 @@ export function TreePage() {
     const res = await api.saveSettings({
       directEnabled: swDirect,
       advertiseLan: swLan,
-      publicUrl: sPublicUrl.trim()
+      publicUrl: sPublicUrl.trim(),
+      publicConsole: swPubCon
     });
     toast(res.ok ? "设置已保存" : res.error || "保存失败");
   }
@@ -399,6 +402,13 @@ export function TreePage() {
           <FieldLabel htmlFor="sPublicUrl">固定公网地址 publicUrl（可选）</FieldLabel>
           <Input id="sPublicUrl" value={sPublicUrl} onChange={(e) => setSPublicUrl(e.target.value)} placeholder="https://astra.example.com" />
         </Field>
+        <label className="mt-3 flex cursor-pointer items-center gap-2.5 text-[13px]">
+          <Switch checked={swPubCon} onCheckedChange={setSwPubCon} />
+          公网控制台
+        </label>
+        <div className="text-muted-foreground mt-1 text-xs">
+          需已配置公网地址且为 bearer 鉴权；关闭后经公网访问的控制台会立即失效。
+        </div>
         <div className="mt-2.5">
           <Button variant="outline" size="sm" onClick={saveToggles}>保存设置</Button>
         </div>

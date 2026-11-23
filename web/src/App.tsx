@@ -6,10 +6,12 @@ import { api, setAdminKey } from "@/lib/api";
 import { pageFromHash, StatusProvider, useStatus } from "@/lib/status";
 import type { PageId } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { OverviewPage } from "@/pages/OverviewPage";
+import { ConnectPage } from "@/pages/ConnectPage";
 import { SdksPage } from "@/pages/SdksPage";
 import { ProjectsPage } from "@/pages/ProjectsPage";
 import { TreePage } from "@/pages/TreePage";
@@ -18,6 +20,7 @@ import { EnvPage } from "@/pages/EnvPage";
 
 const NAV: { id: PageId; label: string }[] = [
   { id: "overview", label: "概览" },
+  { id: "connect", label: "接入客户端" },
   { id: "sdks", label: "SDK 能力" },
   { id: "projects", label: "本地项目" },
   { id: "tree", label: "星图组网" },
@@ -88,6 +91,7 @@ function SideStatus() {
 function Shell({ page, go }: { page: PageId; go: (p: PageId) => void }) {
   const pages: Record<PageId, ReactNode> = {
     overview: <OverviewPage go={go} />,
+    connect: <ConnectPage />,
     sdks: <SdksPage />,
     projects: <ProjectsPage />,
     tree: <TreePage />,
@@ -138,16 +142,17 @@ function Shell({ page, go }: { page: PageId; go: (p: PageId) => void }) {
 }
 
 function LockedScreen() {
-  const { refresh } = useStatus();
+  const { refresh, error } = useStatus();
   const [key, setKey] = useState("");
-  const [failed, setFailed] = useState(false);
+  const [remember, setRemember] = useState(false);
+  const [failed, setFailed] = useState("");
   async function unlock() {
     const k = key.trim();
     if (!k) return;
-    setAdminKey(k);
+    setAdminKey(k, remember);
     setKey("");
     const s = await api.status();
-    setFailed(!s?.ok);
+    setFailed(s?.ok ? "" : s?.error || "密钥不正确或服务不可用。");
     void refresh();
   }
   return (
@@ -158,7 +163,7 @@ function LockedScreen() {
           <h2 className="font-display m-0 text-xl font-semibold">控制台已锁定</h2>
         </div>
         <p className="text-muted-foreground m-0 text-[13px]">
-          需要管理密钥：请从托盘菜单打开控制台，或粘贴 admin-key.txt 中的密钥。
+          需要管理密钥：粘贴 admin-key.txt 中的密钥（Docker 部署在 /data/admin-key.txt）。
         </p>
         <div className="mt-4 flex gap-2">
           <Input
@@ -167,7 +172,7 @@ function LockedScreen() {
             placeholder="粘贴管理密钥"
             onChange={(e) => {
               setKey(e.target.value);
-              setFailed(false);
+              setFailed("");
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter") void unlock();
@@ -175,7 +180,15 @@ function LockedScreen() {
           />
           <Button onClick={() => void unlock()}>解锁</Button>
         </div>
-        {failed && <p className="text-destructive m-0 mt-2 text-xs">解锁失败：密钥不正确或服务不可用。</p>}
+        <label className="text-muted-foreground mt-3 flex items-center gap-2 text-xs">
+          <Checkbox checked={remember} onCheckedChange={(v) => setRemember(v === true)} />
+          在此设备记住
+        </label>
+        {failed ? (
+          <p className="text-destructive m-0 mt-2 text-xs">{failed}</p>
+        ) : error && !error.startsWith("需要管理密钥") ? (
+          <p className="text-destructive m-0 mt-2 text-xs">{error}</p>
+        ) : null}
       </div>
     </div>
   );

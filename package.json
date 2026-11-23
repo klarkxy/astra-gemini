@@ -9,7 +9,9 @@
   "scripts": {
     "start": "node src/server.mjs",
     "test": "node --test test/bridge.test.mjs",
-    "rendezvous": "node src/rendezvous.mjs"
+    "rendezvous": "node src/rendezvous.mjs",
+    "deploy:vps": "node deploy/vps.mjs",
+    "deploy:gateway": "node deploy/gateway.mjs"
   },
   "license": "Apache-2.0"
 }

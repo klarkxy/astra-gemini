@@ -62,11 +62,26 @@ export interface TreeStatus {
 export interface Settings {
   nodeId?: string;
   publicUrl?: string;
+  publicConsole?: boolean;
+  gatewayUrl?: string;
   directEnabled?: boolean;
   advertiseLan?: boolean;
   upstream?: { enabled?: boolean; url?: string; token?: string };
   tunnel?: { mode?: string; publicUrl?: string; hasToken?: boolean };
   [key: string]: unknown;
+}
+
+export interface GatewayCheckItem {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface GatewayCheckResult {
+  ok?: boolean;
+  error?: string;
+  base?: string;
+  checks?: GatewayCheckItem[];
 }
 
 export interface LogEntry {
@@ -104,14 +119,6 @@ export interface RemoteStatus {
   }[];
 }
 
-export interface OauthClient {
-  client_name?: string;
-  client_id: string;
-  redirect_uris?: string[];
-  created_at?: number;
-  activeTokens?: number;
-}
-
 export interface EnvItem {
   available: boolean;
   version?: string;
@@ -128,6 +135,9 @@ export interface StatusResponse {
   joinToken: string;
   hasJoinToken: boolean;
   publicUrl: string;
+  publicMcpUrl: string | null;
+  publicConsole: boolean;
+  rotatable?: { client?: boolean; join?: boolean; admin?: boolean };
   uptimeSec: number;
   settings: Settings;
   projects: ProjectInfo[];
@@ -138,4 +148,4 @@ export interface StatusResponse {
   logs: LogEntry[];
 }
 
-export type PageId = "overview" | "sdks" | "projects" | "tree" | "backups" | "env";
+export type PageId = "overview" | "connect" | "sdks" | "projects" | "tree" | "backups" | "env";

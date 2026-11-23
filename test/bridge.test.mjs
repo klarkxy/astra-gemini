@@ -540,7 +540,7 @@ test("Astra Gemini token split: join token vs client token isolation", async () 
     });
     assert.equal(mcpRes.status, 401);
     const wwwAuth = mcpRes.headers.get("www-authenticate") || "";
-    assert.match(wwwAuth, new RegExp(`resource_metadata="http://127\.0\.0\.1:${port}/\.well-known/oauth-protected-resource/mcp"`));
+    assert.equal(wwwAuth, `Bearer realm="astra-gemini"`);
 
     await assert.rejects(
       () => connectWebSocket(`ws://127.0.0.1:${port}/ws/tree`, { headers: { Authorization: "Bearer client-tok" } }),
@@ -551,26 +551,6 @@ test("Astra Gemini token split: join token vs client token isolation", async () 
       headers: { Authorization: "Bearer join-tok" }
     });
     ws.close(1000);
-
-    const prRes = await new Promise((resolve, reject) => {
-      const r = http.request(
-        {
-          hostname: "127.0.0.1",
-          port,
-          path: "/.well-known/oauth-protected-resource/mcp",
-          headers: { Host: "example.test", "x-forwarded-proto": "https" }
-        },
-        (res) => {
-          const chunks = [];
-          res.on("data", (c) => chunks.push(c));
-          res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
-        }
-      );
-      r.on("error", reject);
-      r.end();
-    });
-    assert.equal(prRes.resource, "https://example.test/mcp");
-    assert.deepEqual(prRes.authorization_servers, ["https://example.test"]);
   } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -646,326 +626,218 @@ test("Astra Gemini nodeId TOFU binding: hijack rejected, admin reset allows re-b
   }
 });
 
-test("Astra Gemini OAuth 2.1: DCR, authorize, PKCE, refresh rotation, persistence", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-oauth-"));
-  const demoRepo = path.join(tmpBase, "demo-repo");
-  initTempGitRepo(demoRepo);
+test("Astra Gemini MCP auth: Bearer-only, OAuth endpoints all 404", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-mcpauth-"));
   const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
-  const projectsConfig = path.join(bridgeState, "projects.json");
-  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
-
-  const clientToken = "oauth-client-tok";
-  const makeServer = () =>
-    createBridgeServer({
-      bridgeRoot: bridgeState,
-      projectsConfigPath: projectsConfig,
-      nodeId: "o",
-      authMode: "bearer",
-      authToken: clientToken,
-      joinToken: "j"
-    });
-
-  const server = makeServer();
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const { port } = server.address();
-  const base = `http://127.0.0.1:${port}`;
-  let accessToken;
-
-  try {
-    const pr = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`).then((r) => r.json());
-    assert.equal(pr.resource, `${base}/mcp`);
-    assert.deepEqual(pr.authorization_servers, [base]);
-
-    const as = await fetch(`${base}/.well-known/oauth-authorization-server`).then((r) => r.json());
-    assert.equal(as.issuer, base);
-    assert.equal(as.token_endpoint, `${base}/oauth/token`);
-    assert.equal(as.registration_endpoint, `${base}/oauth/register`);
-
-    const badReg = await fetch(`${base}/oauth/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ redirect_uris: ["http://evil.example.com/cb"] })
-    });
-    assert.equal(badReg.status, 400);
-    assert.equal((await badReg.json()).error, "invalid_redirect_uri");
-
-    const redirectUri = "https://claude.ai/api/mcp/auth_callback";
-    const reg = await fetch(`${base}/oauth/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_name: "Claude",
-        redirect_uris: [redirectUri],
-        token_endpoint_auth_method: "none"
-      })
-    });
-    assert.equal(reg.status, 201);
-    const client = await reg.json();
-    assert.ok(client.client_id);
-    assert.ok(!client.client_secret);
-    assert.equal(client.token_endpoint_auth_method, "none");
-
-    const verifier = `v-${crypto.randomBytes(32).toString("base64url")}`;
-    const challenge = crypto.createHash("sha256").update(verifier, "utf8").digest("base64url");
-    const authParams = {
-      client_id: client.client_id,
-      response_type: "code",
-      redirect_uri: redirectUri,
-      code_challenge: challenge,
-      code_challenge_method: "S256",
-      state: "st-123",
-      resource: `${base}/mcp`
-    };
-
-    const badAuth = await fetch(
-      `${base}/oauth/authorize?` +
-        new URLSearchParams({ ...authParams, redirect_uri: "https://claude.ai/other_cb" }),
-      { redirect: "manual" }
-    );
-    assert.equal(badAuth.status, 400);
-    assert.equal(badAuth.headers.get("location"), null);
-
-    const getAuth = await fetch(`${base}/oauth/authorize?` + new URLSearchParams(authParams), {
-      redirect: "manual"
-    });
-    assert.equal(getAuth.status, 200);
-    const html = await getAuth.text();
-    assert.match(html, /访问口令/);
-    assert.equal(getAuth.headers.get("x-frame-options"), "DENY");
-
-    const postForm = (body) =>
-      fetch(`${base}/oauth/authorize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams(body),
-        redirect: "manual"
-      });
-
-    const wrongPw = await postForm({ ...authParams, password: "wrong-token" });
-    assert.equal(wrongPw.status, 401);
-    assert.equal(wrongPw.headers.get("location"), null);
-
-    const rightPw = await postForm({ ...authParams, password: clientToken });
-    assert.equal(rightPw.status, 302);
-    const loc = new URL(rightPw.headers.get("location"));
-    assert.equal(loc.origin + loc.pathname, redirectUri);
-    assert.equal(loc.searchParams.get("state"), "st-123");
-    const code = loc.searchParams.get("code");
-    assert.ok(code);
-
-    const postToken = (body) =>
-      fetch(`${base}/oauth/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams(body)
-      });
-
-    const badTok = await postToken({
-      grant_type: "authorization_code",
-      client_id: client.client_id,
-      code,
-      redirect_uri: redirectUri,
-      code_verifier: "wrong-verifier"
-    });
-    assert.equal(badTok.status, 400);
-    assert.equal((await badTok.json()).error, "invalid_grant");
-
-    const tok = await postToken({
-      grant_type: "authorization_code",
-      client_id: client.client_id,
-      code,
-      redirect_uri: redirectUri,
-      code_verifier: verifier
-    });
-    assert.equal(tok.status, 200);
-    const tokens = await tok.json();
-    assert.equal(tokens.token_type, "Bearer");
-    assert.equal(tokens.expires_in, 3600);
-    assert.ok(tokens.access_token && tokens.refresh_token);
-
-    const reuse = await postToken({
-      grant_type: "authorization_code",
-      client_id: client.client_id,
-      code,
-      redirect_uri: redirectUri,
-      code_verifier: verifier
-    });
-    assert.equal((await reuse.json()).error, "invalid_grant");
-
-    const mcpRes = await rpc(base, tokens.access_token, "tools/list");
-    assert.equal(mcpRes.status, 200);
-    assert.ok(mcpRes.body.result.tools.length >= 5);
-
-    const ref1 = await postToken({
-      grant_type: "refresh_token",
-      client_id: client.client_id,
-      refresh_token: tokens.refresh_token
-    });
-    assert.equal(ref1.status, 200);
-    const tokens2 = await ref1.json();
-    assert.notEqual(tokens2.access_token, tokens.access_token);
-    assert.ok(tokens2.refresh_token);
-
-    const refOld = await postToken({
-      grant_type: "refresh_token",
-      client_id: client.client_id,
-      refresh_token: tokens.refresh_token
-    });
-    assert.equal((await refOld.json()).error, "invalid_grant");
-
-    accessToken = tokens2.access_token;
-  } finally {
-    server.close();
-  }
-
-  const server2 = makeServer();
-  await new Promise((r) => server2.listen(0, "127.0.0.1", r));
-  try {
-    const persisted = await rpc(`http://127.0.0.1:${server2.address().port}`, accessToken, "tools/list");
-    assert.equal(persisted.status, 200);
-    assert.ok(persisted.body.result.tools.length >= 5);
-  } finally {
-    server2.close();
-    fs.rmSync(tmpBase, { recursive: true, force: true });
-  }
-});
-
-test("Astra Gemini OAuth CIMD: client_id URL metadata document (Gemini Connected Apps)", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-cimd-"));
-  const demoRepo = path.join(tmpBase, "demo-repo");
-  initTempGitRepo(demoRepo);
-  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
-  const projectsConfig = path.join(bridgeState, "projects.json");
-  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
-
-  const clientToken = "cimd-client-tok";
-  const clientIdUrl = "https://accountlinking.google.com/clientidmetadata/user_bound_provider/test-client";
-  const googleRedirect = "https://oauth-redirect.googleusercontent.com/r/gemini-test";
-  const fetchCalls = [];
-  let docOverride = null;
-  const fetchClientMetadata = async (url) => {
-    fetchCalls.push(url);
-    if (docOverride) return docOverride;
-    return {
-      client_id: url,
-      client_name: "Gemini",
-      redirect_uris: [googleRedirect],
-      token_endpoint_auth_method: "none"
-    };
-  };
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
 
   const server = createBridgeServer({
     bridgeRoot: bridgeState,
-    projectsConfigPath: projectsConfig,
-    nodeId: "o",
+    nodeId: "n1",
     authMode: "bearer",
-    authToken: clientToken,
-    joinToken: "j",
-    fetchClientMetadata
+    authToken: "client-tok",
+    joinToken: "join-tok"
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const { port } = server.address();
   const base = `http://127.0.0.1:${port}`;
 
   try {
-    const as = await fetch(`${base}/.well-known/oauth-authorization-server`).then((r) => r.json());
-    assert.equal(as.client_id_metadata_document_supported, true);
-
-    const verifier = `v-${crypto.randomBytes(32).toString("base64url")}`;
-    const challenge = crypto.createHash("sha256").update(verifier, "utf8").digest("base64url");
-    const authParams = {
-      client_id: clientIdUrl,
-      response_type: "code",
-      redirect_uri: googleRedirect,
-      code_challenge: challenge,
-      code_challenge_method: "S256",
-      state: "st-cimd",
-      resource: `${base}/mcp`
-    };
-
-    // 未注册过的普通 client_id 仍被拒绝
-    const unknown = await fetch(
-      `${base}/oauth/authorize?` + new URLSearchParams({ ...authParams, client_id: "mcp_unknown" }),
-      { redirect: "manual" }
-    );
-    assert.equal(unknown.status, 400);
-    assert.match(await unknown.text(), /未知的 client_id/);
-
-    // redirect_uri 不在元数据文档中 → 拒绝
-    const badUri = await fetch(
-      `${base}/oauth/authorize?` +
-        new URLSearchParams({ ...authParams, redirect_uri: "https://oauth-redirect.googleusercontent.com/evil" }),
-      { redirect: "manual" }
-    );
-    assert.equal(badUri.status, 400);
-    assert.equal(badUri.headers.get("location"), null);
-
-    // 元数据 doc.client_id 与 URL 不一致 → 拒绝（换一个新的 client_id URL 避开缓存）
-    const badClientIdUrl = "https://accountlinking.google.com/clientidmetadata/user_bound_provider/bad-client";
-    docOverride = { client_id: "https://other.example.com/meta", redirect_uris: [googleRedirect] };
-    const mismatch = await fetch(
-      `${base}/oauth/authorize?` + new URLSearchParams({ ...authParams, client_id: badClientIdUrl }),
-      { redirect: "manual" }
-    );
-    assert.equal(mismatch.status, 400);
-    assert.match(await mismatch.text(), /client_id 与 URL 不一致/);
-    docOverride = null;
-
-    // 完整流程：授权页 → 口令 → code → token
-    const getAuth = await fetch(`${base}/oauth/authorize?` + new URLSearchParams(authParams), {
-      redirect: "manual"
-    });
-    assert.equal(getAuth.status, 200);
-    assert.match(await getAuth.text(), /Gemini/);
-
-    const rightPw = await fetch(`${base}/oauth/authorize`, {
+    const unauth = await fetch(`${base}/mcp`, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ ...authParams, password: clientToken }),
-      redirect: "manual"
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })
     });
-    assert.equal(rightPw.status, 302);
-    const loc = new URL(rightPw.headers.get("location"));
-    assert.equal(loc.origin + loc.pathname, googleRedirect);
-    assert.equal(loc.searchParams.get("state"), "st-cimd");
-    const code = loc.searchParams.get("code");
-    assert.ok(code);
+    assert.equal(unauth.status, 401);
+    assert.equal(unauth.headers.get("www-authenticate"), `Bearer realm="astra-gemini"`);
 
-    const tok = await fetch(`${base}/oauth/token`, {
+    for (const [method, p] of [
+      ["GET", "/.well-known/oauth-authorization-server"],
+      ["GET", "/.well-known/oauth-protected-resource"],
+      ["GET", "/.well-known/oauth-protected-resource/mcp"],
+      ["POST", "/oauth/register"],
+      ["GET", "/oauth/authorize"],
+      ["POST", "/oauth/token"]
+    ]) {
+      const r = await fetch(`${base}${p}`, { method });
+      assert.equal(r.status, 404, `${method} ${p} should be 404, got ${r.status}`);
+    }
+
+    const ok = await fetch(`${base}/mcp`, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: clientIdUrl,
-        code,
-        redirect_uri: googleRedirect,
-        code_verifier: verifier
-      })
+      headers: { "Content-Type": "application/json", Authorization: "Bearer client-tok" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })
     });
-    assert.equal(tok.status, 200);
-    const tokens = await tok.json();
-    assert.ok(tokens.access_token && tokens.refresh_token);
-
-    const mcpRes = await rpc(base, tokens.access_token, "tools/list");
-    assert.equal(mcpRes.status, 200);
-    assert.ok(mcpRes.body.result.tools.length >= 5);
-
-    const ref = await fetch(`${base}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        client_id: clientIdUrl,
-        refresh_token: tokens.refresh_token
-      })
-    });
-    assert.equal(ref.status, 200);
-
-    // 命中缓存：正常 client 的两次 authorize + 两次 token 只拉取一次元数据
-    assert.deepEqual(fetchCalls, [clientIdUrl, badClientIdUrl]);
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).result.serverInfo.name, "astra-gemini");
   } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Astra Gemini public console: opt-in Host/Origin gating + admin lockout", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-pubcon-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(projectsConfig, "{}", "utf8");
+
+  const token = "pubcon-tok";
+  const pub = "https://astra.example.com";
+  const pubHost = "astra.example.com";
+
+  const raw = (port, p, method, headers = {}) =>
+    new Promise((resolve, reject) => {
+      const req = http.request({ hostname: "127.0.0.1", port, path: p, method, headers }, (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") })
+        );
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  const pubGet = (port, p, extra = {}) =>
+    raw(port, p, "GET", { host: pubHost, "x-forwarded-for": "1.2.3.4", ...extra });
+  const pubGetJson = async (port, p, extra = {}) => {
+    const r = await pubGet(port, p, extra);
+    return { status: r.status, headers: r.headers, json: JSON.parse(r.body) };
+  };
+
+  // 默认关闭：公网 Host + 转发头依旧 403
+  const offServer = createBridgeServer({
+    bridgeRoot: bridgeState,
+    projectsConfigPath: projectsConfig,
+    nodeId: "o",
+    authMode: "bearer",
+    authToken: token,
+    publicUrl: pub,
+    publicConsole: false
+  });
+  await new Promise((r) => offServer.listen(0, "127.0.0.1", r));
+  const offPort = offServer.address().port;
+  try {
+    const res = await pubGet(offPort, "/api/status", { "x-astra-admin": token });
+    assert.equal(res.status, 403);
+  } finally {
+    offServer.close();
+  }
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    projectsConfigPath: projectsConfig,
+    nodeId: "o",
+    authMode: "bearer",
+    authToken: token,
+    publicUrl: pub,
+    publicConsole: true
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address();
+
+  try {
+    // 正确 Host + 无 Origin + 正确密钥 → 200
+    const ok = await pubGetJson(port, "/api/status", { "x-astra-admin": token });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.json.publicConsole, true);
+    assert.equal(ok.json.publicMcpUrl, `${pub}/mcp`);
+
+    // Host 不对 / Origin 不匹配 / cross-site → 403
+    const badHost = await raw(port, "/api/status", "GET", {
+      host: "evil.example.com",
+      "x-forwarded-for": "1.2.3.4",
+      "x-astra-admin": token
+    });
+    assert.equal(badHost.status, 403);
+    const badOrigin = await pubGet(port, "/api/status", { origin: "https://evil.example.com", "x-astra-admin": token });
+    assert.equal(badOrigin.status, 403);
+    const goodOrigin = await pubGet(port, "/api/status", { origin: pub, "x-astra-admin": token });
+    assert.equal(goodOrigin.status, 200);
+    const crossSite = await pubGet(port, "/api/status", { "sec-fetch-site": "cross-site", "x-astra-admin": token });
+    assert.equal(crossSite.status, 403);
+
+    // /remote/* 公网一律拒绝
+    const remote = await raw(port, "/remote/x/mcp", "POST", {
+      host: pubHost,
+      "x-forwarded-for": "1.2.3.4",
+      "x-astra-admin": token
+    });
+    assert.equal(remote.status, 403);
+
+    // 公网 /ui 附带安全头
+    const ui = await pubGet(port, "/ui");
+    assert.equal(ui.status, 200);
+    assert.equal(ui.headers["x-frame-options"], "DENY");
+    assert.equal(ui.headers["referrer-policy"], "no-referrer");
+    assert.match(ui.headers["content-security-policy"], /frame-ancestors 'none'/);
+
+    // 锁定：缺密钥不计数（1），再 10 次错密钥（此时 >10 判据未达 → 正确密钥仍可用），
+    // 第 11 次错密钥后锁定，公网正确密钥 429，本机仍 200。
+    const noKey = await pubGetJson(port, "/api/status");
+    assert.equal(noKey.status, 401);
+    for (let i = 0; i < 10; i++) {
+      const r = await pubGet(port, "/api/status", { "x-astra-admin": "wrong" });
+      assert.equal(r.status, 401);
+    }
+    const stillOk = await pubGet(port, "/api/status", { "x-astra-admin": token });
+    assert.equal(stillOk.status, 200);
+    const eleventh = await pubGet(port, "/api/status", { "x-astra-admin": "wrong" });
+    assert.equal(eleventh.status, 401);
+    const locked = await pubGetJson(port, "/api/status", { "x-astra-admin": token });
+    assert.equal(locked.status, 429);
+    assert.equal(locked.json.code, "admin_locked");
+    const localOk = await raw(port, "/api/status", "GET", { "x-astra-admin": token });
+    assert.equal(localOk.status, 200);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("docker settings-init: env seeds nodeId/upstream on first boot only, LAN flags forced off", () => {
+  const script = path.join(REPO_ROOT, "docker", "settings-init.mjs");
+  const runInit = (dir, env = {}) =>
+    spawnSync(process.execPath, [script], {
+      env: { ...process.env, ASTRA_BRIDGE_ROOT: dir, ...env },
+      encoding: "utf8"
+    });
+
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "astra-si1-"));
+  try {
+    const r1 = runInit(d, {
+      ASTRA_NODE_ID: "seeded-node",
+      ASTRA_UPSTREAM_URL: "wss://up.example.com/ws/tree",
+      ASTRA_UPSTREAM_TOKEN: "up-tok",
+      ASTRA_PUBLIC_URL: "https://pub.example.com"
+    });
+    assert.equal(r1.status, 0, r1.stderr);
+    const s1 = JSON.parse(fs.readFileSync(path.join(d, "settings.json"), "utf8"));
+    assert.equal(s1.nodeId, "seeded-node");
+    assert.equal(s1.upstream.enabled, true);
+    assert.equal(s1.upstream.url, "wss://up.example.com/ws/tree");
+    assert.equal(s1.upstream.token, "up-tok");
+    assert.equal(s1.advertiseLan, false);
+    assert.equal(s1.p2p.upnp, false);
+    // ASTRA_PUBLIC_URL 不再写入 settings（服务端直接回退 env）
+    assert.equal(s1.publicUrl, "");
+
+    // 二次启动：控制台修改过的设置不被 env 覆盖，容器约束仍强制
+    const s2in = { ...s1, nodeId: "console-renamed", publicUrl: "https://console.example.com" };
+    fs.writeFileSync(path.join(d, "settings.json"), JSON.stringify(s2in), "utf8");
+    const r2 = runInit(d, {
+      ASTRA_NODE_ID: "other-node",
+      ASTRA_UPSTREAM_URL: "wss://other.example.com/ws/tree"
+    });
+    assert.equal(r2.status, 0, r2.stderr);
+    const s2 = JSON.parse(fs.readFileSync(path.join(d, "settings.json"), "utf8"));
+    assert.equal(s2.nodeId, "console-renamed");
+    assert.equal(s2.publicUrl, "https://console.example.com");
+    assert.equal(s2.upstream.url, "wss://up.example.com/ws/tree");
+    assert.equal(s2.advertiseLan, false);
+    assert.equal(s2.p2p.upnp, false);
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
   }
 });
 
@@ -1112,103 +984,6 @@ test("Astra Gemini relay timeout: relayed exec_verify uses tool timeout + hop gr
     leafServer.close();
     branchServer.close();
     rootServer.close();
-    fs.rmSync(tmpBase, { recursive: true, force: true });
-  }
-});
-test("Astra Gemini OAuth: register rate limit + eviction protects tokened clients", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-dcr-"));
-  const demoRepo = path.join(tmpBase, "demo-repo");
-  initTempGitRepo(demoRepo);
-  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
-  const projectsConfig = path.join(bridgeState, "projects.json");
-  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: demoRepo, mode: "direct", sdks: ["git"] } }), "utf8");
-
-  const clientToken = "dcr-tok";
-  const server = createBridgeServer({
-    bridgeRoot: bridgeState,
-    projectsConfigPath: projectsConfig,
-    nodeId: "dcr",
-    authMode: "bearer",
-    authToken: clientToken,
-    joinToken: "j",
-    oauthMaxClients: 3,
-    oauthRegisterLimit: 5
-  });
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const { port } = server.address();
-  const base = `http://127.0.0.1:${port}`;
-
-  try {
-    const redirectUri = "https://claude.ai/api/mcp/auth_callback";
-    const regA = await fetch(`${base}/oauth/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_name: "Keeper", redirect_uris: [redirectUri], token_endpoint_auth_method: "none" })
-    });
-    assert.equal(regA.status, 201);
-    const clientA = (await regA.json()).client_id;
-
-    const verifier = "v-" + crypto.randomBytes(32).toString("base64url");
-    const challenge = crypto.createHash("sha256").update(verifier, "utf8").digest("base64url");
-    const authParams = {
-      client_id: clientA,
-      response_type: "code",
-      redirect_uri: redirectUri,
-      code_challenge: challenge,
-      code_challenge_method: "S256",
-      resource: `${base}/mcp`
-    };
-    const authRes = await fetch(`${base}/oauth/authorize`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ ...authParams, password: clientToken }),
-      redirect: "manual"
-    });
-    assert.equal(authRes.status, 302);
-    const code = new URL(authRes.headers.get("location")).searchParams.get("code");
-    const tokRes = await fetch(`${base}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: clientA,
-        code,
-        redirect_uri: redirectUri,
-        code_verifier: verifier
-      })
-    });
-    assert.equal(tokRes.status, 200);
-    const tokens = await tokRes.json();
-    assert.ok(tokens.refresh_token);
-
-    const statuses = [];
-    for (let i = 0; i < 5; i++) {
-      const r = await fetch(`${base}/oauth/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_name: `spam${i}`, redirect_uris: [`https://spam${i}.example.com/cb`] })
-      });
-      statuses.push(r.status);
-    }
-    assert.deepEqual(statuses, [201, 201, 201, 201, 429]);
-
-    const list = await fetch(`${base}/api/oauth`, { headers: { "X-Astra-Admin": "dcr-tok" } }).then((r) => r.json());
-    assert.equal(list.clients.length, 3);
-    assert.ok(list.clients.some((c) => c.client_id === clientA));
-
-    const ref = await fetch(`${base}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        client_id: clientA,
-        refresh_token: tokens.refresh_token
-      })
-    });
-    assert.equal(ref.status, 200);
-    assert.ok((await ref.json()).access_token);
-  } finally {
-    server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });
@@ -1602,14 +1377,14 @@ test("remote relay fallback: ciphertext-only bytes over rendezvous when direct f
     rvUrl, rvToken: "rvt", authToken: "tA", joinToken: "jA", candidates: () => dead, windowMs: 600
   });
   const B = await startRemoteNode(tmpBase, "nodeB", {
-    rvUrl, rvToken: "rvt", authToken: "tB", joinToken: "jB", candidates: () => dead, windowMs: 600, demoRoot: bRepo
+    rvUrl, rvToken: "rvt", authToken: "relayTokB-7c9e2f41", joinToken: "jB", candidates: () => dead, windowMs: 600, demoRoot: bRepo
   });
 
   try {
     const statB = await remoteStatus(B);
     await waitRvConnected(A, B);
 
-    const list = await rpcRemote(A.baseUrl, statB.address, "tB", "tools/list");
+    const list = await rpcRemote(A.baseUrl, statB.address, "relayTokB-7c9e2f41", "tools/list");
     assert.equal(list.status, 200);
 
     const statA2 = await remoteStatus(A);
@@ -1623,7 +1398,7 @@ test("remote relay fallback: ciphertext-only bytes over rendezvous when direct f
     assert.equal(ok, true);
 
     const blob = Buffer.concat(captured).toString("latin1");
-    assert.equal(blob.includes("tB"), false);
+    assert.equal(blob.includes("relayTokB-7c9e2f41"), false);
     assert.equal(blob.includes("tools/list"), false);
   } finally {
     A.server.close();
@@ -1807,7 +1582,7 @@ test("upnp: fake IGD controlURL parsing, AddPortMapping fields, DeletePortMappin
 });
 
 test("remote auth guard: authMode none node rejects remote channel requests with 403", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-noauth-"));
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-authnone-"));
   const rv = createRendezvousServer({ token: "rvt" });
   await listenOn(rv.server);
   const rvUrl = `ws://127.0.0.1:${rv.server.address().port}`;
@@ -2171,6 +1946,312 @@ test("secret file ACLs: writeSecretFile + startup hardenSecretFiles restrict to 
       server.close();
     }
   } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+async function adminPost(baseUrl, apiPath, body, adminKey) {
+  const res = await fetch(`${baseUrl}${apiPath}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Astra-Admin": adminKey },
+    body: JSON.stringify(body)
+  });
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+test("secrets rotate: client/join/admin rotation updates memory + file", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-rotate-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+  // 模拟 entrypoint/tray：密钥来自 bridgeRoot 下的文件
+  fs.writeFileSync(path.join(bridgeState, "token.txt"), "file-tok", "utf8");
+  fs.writeFileSync(path.join(bridgeState, "join-token.txt"), "join-tok", "utf8");
+  fs.writeFileSync(path.join(bridgeState, "admin-key.txt"), "admin-secret", "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "rot",
+    authMode: "bearer",
+    authToken: "file-tok",
+    joinToken: "join-tok",
+    adminKey: "admin-secret"
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const st0 = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "admin-secret" } }).then((r) => r.json());
+    assert.deepEqual(st0.rotatable, { client: true, join: true, admin: true });
+
+    const bad = await adminPost(base, "/api/secrets/rotate", { kind: "bogus" }, "admin-secret");
+    assert.equal(bad.status, 400);
+
+    const rotClient = await adminPost(base, "/api/secrets/rotate", { kind: "client" }, "admin-secret");
+    assert.equal(rotClient.status, 200);
+    const newClient = rotClient.body.value;
+    assert.match(newClient, /^[0-9a-f]{64}$/);
+    assert.equal(fs.readFileSync(path.join(bridgeState, "token.txt"), "utf8"), newClient);
+    assert.equal((await rpc(base, "file-tok", "tools/list")).status, 401);
+    assert.equal((await rpc(base, newClient, "tools/list")).status, 200);
+
+    const rotJoin = await adminPost(base, "/api/secrets/rotate", { kind: "join" }, "admin-secret");
+    assert.equal(rotJoin.status, 200);
+    const newJoin = rotJoin.body.value;
+    assert.equal(fs.readFileSync(path.join(bridgeState, "join-token.txt"), "utf8"), newJoin);
+    const st1 = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "admin-secret" } }).then((r) => r.json());
+    assert.equal(st1.joinToken, newJoin);
+
+    const rotAdmin = await adminPost(base, "/api/secrets/rotate", { kind: "admin" }, "admin-secret");
+    assert.equal(rotAdmin.status, 200);
+    const newAdmin = rotAdmin.body.value;
+    assert.equal(fs.readFileSync(path.join(bridgeState, "admin-key.txt"), "utf8"), newAdmin);
+    const oldKey = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "admin-secret" } });
+    assert.equal(oldKey.status, 401);
+    const newKey = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": newAdmin } });
+    assert.equal(newKey.status, 200);
+    // 密钥值不出现在日志里
+    const st2 = await newKey.json();
+    assert.equal(JSON.stringify(st2.logs).includes(newAdmin), false);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("secrets rotate: env-pinned secret -> 409 and rotatable=false", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-pinned-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+  // 没有任何密钥文件 → 值完全由 env 固定
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "pin",
+    authMode: "bearer",
+    authToken: "pinned-tok"
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const res = await adminPost(base, "/api/secrets/rotate", { kind: "client" }, "pinned-tok");
+    assert.equal(res.status, 409);
+    assert.match(res.body.error, /环境变量固定/);
+    const st = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "pinned-tok" } }).then((r) => r.json());
+    assert.deepEqual(st.rotatable, { client: false, join: false, admin: false });
+
+    // 文件存在但内容与当前值不一致（如手动改过文件）→ 仍视为 env 固定
+    fs.writeFileSync(path.join(bridgeState, "token.txt"), "different-tok", "utf8");
+    const res2 = await adminPost(base, "/api/secrets/rotate", { kind: "client" }, "pinned-tok");
+    assert.equal(res2.status, 409);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("secrets rotate: admin fallback follows rotated client token", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-admfb-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+  fs.writeFileSync(path.join(bridgeState, "token.txt"), "fb-tok", "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "fb",
+    authMode: "bearer",
+    authToken: "fb-tok"
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    // 未设独立管理密钥 → 管理密钥回退为客户端 Token
+    const before = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "fb-tok" } });
+    assert.equal(before.status, 200);
+    const rot = await adminPost(base, "/api/secrets/rotate", { kind: "client" }, "fb-tok");
+    assert.equal(rot.status, 200);
+    const newTok = rot.body.value;
+    const oldAsAdmin = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "fb-tok" } });
+    assert.equal(oldAsAdmin.status, 401);
+    const newAsAdmin = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": newTok } });
+    assert.equal(newAsAdmin.status, 200);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("publicConsole via POST /api/settings toggles public-Host access to /ui", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-pubset-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+
+  const token = "pubset-tok";
+  const pub = "https://astra.example.com";
+  const prevEnv = process.env.ASTRA_PUBLIC_CONSOLE;
+  delete process.env.ASTRA_PUBLIC_CONSOLE;
+
+  // 不传 options.publicConsole：走 settings/env 回退路径
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "ps",
+    authMode: "bearer",
+    authToken: token,
+    publicUrl: pub
+  });
+  await listenOn(server);
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+  const pubUi = () =>
+    new Promise((resolve, reject) => {
+      const req = http.request(
+        { hostname: "127.0.0.1", port, path: "/ui", method: "GET", headers: { host: "astra.example.com", "x-forwarded-for": "1.2.3.4" } },
+        (res) => {
+          res.resume();
+          res.on("end", () => resolve(res.statusCode));
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+
+  try {
+    assert.equal(await pubUi(), 403);
+    const on = await adminPost(base, "/api/settings", { publicConsole: true }, token);
+    assert.equal(on.status, 200);
+    assert.equal(await pubUi(), 200);
+    const st = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": token } }).then((r) => r.json());
+    assert.equal(st.settings.publicConsole, true);
+    assert.equal(st.publicConsole, true);
+    const off = await adminPost(base, "/api/settings", { publicConsole: false }, token);
+    assert.equal(off.status, 200);
+    assert.equal(await pubUi(), 403);
+  } finally {
+    if (prevEnv === undefined) delete process.env.ASTRA_PUBLIC_CONSOLE;
+    else process.env.ASTRA_PUBLIC_CONSOLE = prevEnv;
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("settings.publicUrl takes precedence over ASTRA_PUBLIC_URL env", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-puburl-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+
+  const token = "envtok";
+  const prevEnv = process.env.ASTRA_PUBLIC_URL;
+  process.env.ASTRA_PUBLIC_URL = "https://env.example.com";
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "eu",
+    authMode: "bearer",
+    authToken: token
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const getStatus = () => fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": token } }).then((r) => r.json());
+
+  try {
+    const st0 = await getStatus();
+    assert.equal(st0.publicMcpUrl, "https://env.example.com/mcp");
+
+    const saved = await adminPost(base, "/api/settings", { publicUrl: "https://cfg.example.com" }, token);
+    assert.equal(saved.status, 200);
+    const st1 = await getStatus();
+    assert.equal(st1.publicMcpUrl, "https://cfg.example.com/mcp");
+  } finally {
+    if (prevEnv === undefined) delete process.env.ASTRA_PUBLIC_URL;
+    else process.env.ASTRA_PUBLIC_URL = prevEnv;
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("gateway check: discovery + protected-resource + 401 probe against stub", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-gwck-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+
+  const token = "gw-tok";
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "gw",
+    authMode: "bearer",
+    authToken: token
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const mkStub = async ({ resource, mcpStatus }) => {
+    const stub = http.createServer((req, res) => {
+      const u = new URL(req.url, "http://x");
+      if (req.method === "GET" && u.pathname === "/.well-known/oauth-authorization-server") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ authorization_endpoint: "https://x/authorize", token_endpoint: "https://x/oauth/token" }));
+        return;
+      }
+      if (req.method === "GET" && u.pathname === "/.well-known/oauth-protected-resource/mcp") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ resource }));
+        return;
+      }
+      if (req.method === "POST" && u.pathname === "/mcp") {
+        res.writeHead(mcpStatus).end();
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await listenOn(stub);
+    return stub;
+  };
+
+  try {
+    const bad = await mkStub({ resource: "wrong-resource", mcpStatus: 200 });
+    const badBase = `http://127.0.0.1:${bad.address().port}`;
+    const res2 = await adminPost(base, "/api/gateway/check", { url: badBase }, token);
+    assert.equal(res2.status, 200);
+    assert.equal(res2.body.ok, false);
+    assert.equal(res2.body.checks.find((c) => c.name === "授权服务发现").ok, true);
+    assert.equal(res2.body.checks.find((c) => c.name === "受保护资源元数据").ok, false);
+    assert.equal(res2.body.checks.find((c) => c.name === "MCP 需鉴权").ok, false);
+    bad.close();
+
+    // resource 完全匹配 + /mcp 401 → 全部通过；url 带 /mcp 后缀会被归一化
+    let okBase = "";
+    const okStub = http.createServer((req, res) => {
+      const u = new URL(req.url, "http://x");
+      if (u.pathname === "/.well-known/oauth-protected-resource/mcp") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ resource: `${okBase}/mcp` }));
+        return;
+      }
+      if (u.pathname === "/.well-known/oauth-authorization-server") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ authorization_endpoint: "a", token_endpoint: "t" }));
+        return;
+      }
+      if (req.method === "POST" && u.pathname === "/mcp") {
+        res.writeHead(401).end();
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await listenOn(okStub);
+    okBase = `http://127.0.0.1:${okStub.address().port}`;
+    const res3 = await adminPost(base, "/api/gateway/check", { url: `${okBase}/mcp` }, token);
+    assert.equal(res3.status, 200);
+    assert.equal(res3.body.ok, true, JSON.stringify(res3.body));
+    assert.equal(res3.body.checks.every((c) => c.ok), true);
+    assert.equal(res3.body.base, okBase);
+    okStub.close();
+
+    // 非本机 http 一律拒绝
+    const rejected = await adminPost(base, "/api/gateway/check", { url: "http://203.0.113.10:8080" }, token);
+    assert.equal(rejected.status, 400);
+  } finally {
+    server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });
