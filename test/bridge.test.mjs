@@ -700,11 +700,52 @@ test("Gemini schema & protocol hygiene: version negotiation, instructions, expli
 
     const initFallback = await rpc(base, "schema-tok", "initialize", { protocolVersion: "1999-01-01" });
     assert.equal(initFallback.body.result.protocolVersion, "2025-03-26");
+    const initLegacy = await rpc(base, "schema-tok", "initialize", { protocolVersion: "2024-11-05" });
+    assert.equal(initLegacy.body.result.protocolVersion, "2025-03-26");
+
+    const postMcp = (payload, extraHeaders = {}) =>
+      fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer schema-tok", ...extraHeaders },
+        body: JSON.stringify(payload)
+      });
+    const badVersion = await postMcp(
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+      { "MCP-Protocol-Version": "1999-01-01" }
+    );
+    assert.equal(badVersion.status, 400);
+    const badVersionBody = await badVersion.json();
+    assert.equal(badVersionBody.error.code, -32600);
+    assert.match(badVersionBody.error.message, /Unsupported MCP-Protocol-Version: 1999-01-01/);
+
+    const goodVersion = await postMcp(
+      { jsonrpc: "2.0", id: 3, method: "tools/list" },
+      { "MCP-Protocol-Version": "2025-06-18" }
+    );
+    assert.equal(goodVersion.status, 200);
+    assert.equal((await goodVersion.json()).result.tools.length, 5);
+
+    const badNotifVersion = await postMcp(
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { "MCP-Protocol-Version": "1999-01-01" }
+    );
+    assert.equal(badNotifVersion.status, 400);
+    assert.equal((await badNotifVersion.json()).error.code, -32600);
+
+    const initBadHeader = await postMcp(
+      { jsonrpc: "2.0", id: 4, method: "initialize", params: { protocolVersion: "2025-06-18" } },
+      { "MCP-Protocol-Version": "1999-01-01" }
+    );
+    assert.equal(initBadHeader.status, 200);
+    assert.equal((await initBadHeader.json()).result.protocolVersion, "2025-06-18");
 
     const listed = await rpc(base, "schema-tok", "tools/list");
     assert.equal(listed.status, 200);
     const tools = listed.body.result.tools || [];
     assert.equal(tools.length, 5);
+    const execVerify = tools.find((tool) => tool.name === "exec_verify");
+    assert.equal(execVerify.annotations.destructiveHint, true);
+    assert.equal(execVerify.annotations.openWorldHint, true);
     const problems = [];
     const walk = (node, at) => {
       if (Array.isArray(node)) {
@@ -807,6 +848,20 @@ test("Gemini dual-format hashes: array/JSON-string knownHashes and expectedHashe
     })).body.result.structuredContent;
     assert.equal(badExists.ok, false);
     assert.match(badExists.error, /not to exist/i);
+
+    const missingHash = (await rpc(base, "dual-tok", "tools/call", {
+      name: "apply_patch",
+      arguments: { project: "demo", patch: createPatch, expectedHashes: [{ path: "app.js" }], dryRun: true }
+    })).body.result;
+    assert.equal(missingHash.isError, true);
+    assert.match(missingHash.content[0].text, /hash is required/);
+
+    const invalidJson = (await rpc(base, "dual-tok", "tools/call", {
+      name: "apply_patch",
+      arguments: { project: "demo", patch: createPatch, expectedHashes: "{not json", dryRun: true }
+    })).body.result;
+    assert.equal(invalidJson.isError, true);
+    assert.match(invalidJson.content[0].text, /not valid JSON/);
   } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -825,15 +880,16 @@ test("Capability URL /mcp/<secret>: no-header access, method hygiene, disable sw
     nodeId: "cap",
     authMode: "bearer",
     authToken: "client-tok",
-    mcpPathToken: initialSecret
+    mcpPathToken: initialSecret,
+    publicUrl: "https://astra.example.com"
   });
   await listenOn(server);
   const base = `http://127.0.0.1:${server.address().port}`;
   const initPayload = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } };
-  const postCap = (secret, payload = initPayload) =>
+  const postCap = (secret, payload = initPayload, extraHeaders = {}) =>
     fetch(`${base}/mcp/${encodeURIComponent(secret)}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...extraHeaders },
       body: JSON.stringify(payload)
     });
 
@@ -842,6 +898,7 @@ test("Capability URL /mcp/<secret>: no-header access, method hygiene, disable sw
     assert.equal(st0.mcpPathToken, initialSecret);
     assert.equal(st0.mcpPathEnabled, true);
     assert.equal(st0.rotatable.mcpPath, true);
+    assert.equal(st0.publicGeminiMcpUrl, "https://astra.example.com/mcp/" + initialSecret);
 
     const ok = await postCap(initialSecret);
     assert.equal(ok.status, 200);
@@ -850,11 +907,47 @@ test("Capability URL /mcp/<secret>: no-header access, method hygiene, disable sw
     const wrong = await postCap("c".repeat(64));
     assert.equal(wrong.status, 404);
     assert.equal(wrong.headers.get("www-authenticate"), null);
+    await wrong.text();
 
     const opt = await fetch(`${base}/mcp/${initialSecret}`, { method: "OPTIONS" });
     assert.equal(opt.status, 204);
     assert.equal(opt.headers.get("allow"), "POST, OPTIONS");
-    assert.equal(opt.headers.get("access-control-allow-origin"), "*");
+    assert.equal(opt.headers.get("access-control-allow-origin"), null);
+    assert.match(opt.headers.get("vary") || "", /Origin/);
+
+    const optGemini = await fetch(`${base}/mcp/${initialSecret}`, {
+      method: "OPTIONS",
+      headers: { Origin: "https://gemini.google.com" }
+    });
+    assert.equal(optGemini.status, 204);
+    assert.equal(optGemini.headers.get("access-control-allow-origin"), "https://gemini.google.com");
+    assert.match(optGemini.headers.get("vary") || "", /Origin/);
+
+    const evilOrigin = await postCap(initialSecret, initPayload, { Origin: "https://evil.example.com" });
+    assert.equal(evilOrigin.status, 403);
+    assert.equal(evilOrigin.headers.get("access-control-allow-origin"), null);
+    await evilOrigin.text();
+
+    const publicOrigin = await postCap(initialSecret, initPayload, { Origin: "https://astra.example.com" });
+    assert.equal(publicOrigin.status, 200);
+    assert.equal(publicOrigin.headers.get("access-control-allow-origin"), "https://astra.example.com");
+    await publicOrigin.text();
+
+    const wrongEvil = await postCap("c".repeat(64), initPayload, { Origin: "https://evil.example.com" });
+    assert.equal(wrongEvil.status, 404);
+    await wrongEvil.text();
+
+    const bearerEvil = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer client-tok",
+        Origin: "https://evil.example.com"
+      },
+      body: JSON.stringify(initPayload)
+    });
+    assert.equal(bearerEvil.status, 403);
+    await bearerEvil.text();
 
     const get = await fetch(`${base}/mcp/${initialSecret}`);
     assert.equal(get.status, 405);
@@ -888,6 +981,98 @@ test("Capability URL /mcp/<secret>: no-header access, method hygiene, disable sw
     assert.equal((await rpc(base, "client-tok", "tools/list")).status, 200);
   } finally {
     server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("MCP Origin allowlist entries and Gemini URL token encoding edge cases", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-mcpedge-"));
+  const initPayload = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } };
+  const makeBridge = (name) => {
+    const dir = makeTempBridgeRoot(tmpBase, name);
+    fs.writeFileSync(path.join(dir, "projects.json"), "{}", "utf8");
+    return dir;
+  };
+  const postInit = (url, headers = {}) =>
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(initPayload)
+    });
+
+  try {
+    {
+      const bridgeState = makeBridge("custom-origin");
+      const server = createBridgeServer({
+        bridgeRoot: bridgeState,
+        nodeId: "custom",
+        authMode: "bearer",
+        authToken: "custom-tok",
+        mcpAllowedOrigins: ["https://inspector.example/"]
+      });
+      await listenOn(server);
+      const base = `http://127.0.0.1:${server.address().port}`;
+      try {
+        const res = await postInit(`${base}/mcp`, {
+          Authorization: "Bearer custom-tok",
+          Origin: "https://inspector.example"
+        });
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get("access-control-allow-origin"), "https://inspector.example");
+        assert.equal((await res.json()).result.serverInfo.name, "astra-gemini");
+      } finally {
+        server.close();
+      }
+    }
+
+    {
+      const bridgeState = makeBridge("short-token");
+      const server = createBridgeServer({
+        bridgeRoot: bridgeState,
+        nodeId: "short",
+        authMode: "bearer",
+        authToken: "short-tok",
+        mcpPathToken: "short",
+        publicUrl: "https://short.example.com"
+      });
+      await listenOn(server);
+      const base = `http://127.0.0.1:${server.address().port}`;
+      try {
+        const status = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "short-tok" } }).then((r) => r.json());
+        assert.equal(status.publicGeminiMcpUrl, null);
+        const res = await postInit(`${base}/mcp/short`);
+        assert.equal(res.status, 404);
+        await res.text();
+      } finally {
+        server.close();
+      }
+    }
+
+    {
+      const bridgeState = makeBridge("special-token");
+      const specialToken = "x".repeat(40) + "a/b?c%d";
+      const server = createBridgeServer({
+        bridgeRoot: bridgeState,
+        nodeId: "special",
+        authMode: "bearer",
+        authToken: "special-tok",
+        mcpPathToken: specialToken,
+        publicUrl: "https://special.example.com"
+      });
+      await listenOn(server);
+      const base = `http://127.0.0.1:${server.address().port}`;
+      try {
+        const status = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "special-tok" } }).then((r) => r.json());
+        const encodedToken = encodeURIComponent(specialToken);
+        assert.equal(status.publicGeminiMcpUrl, `https://special.example.com/mcp/${encodedToken}`);
+        const res = await postInit(`${base}/mcp/${encodedToken}`);
+        assert.equal(res.status, 200);
+        assert.equal((await res.json()).result.serverInfo.name, "astra-gemini");
+      } finally {
+        server.close();
+      }
+    }
+  } finally {
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });

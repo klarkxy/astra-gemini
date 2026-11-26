@@ -95,6 +95,7 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
 ## 安全模型
 
 - **凭据权限边界**：客户端 Token → `/mcp` 全部工具；Gemini 路径密钥 → `/mcp/<mcpPathToken>` 全部工具；入网 Token → 仅 `/ws/tree` 注册。三者互不相通（`/mcp` 交叉使用均 401；错误路径密钥一律 404），比较均使用恒定时算法。
+- `/mcp` 与 `/mcp/<mcpPathToken>` 校验浏览器 `Origin` 白名单：仅 `https://gemini.google.com`、已配置 `publicUrl` 的 origin 与 `ASTRA_MCP_ALLOWED_ORIGINS`（逗号分隔）中的条目可访问，其余携带 `Origin` 的请求一律 403；不带 `Origin` 的服务端客户端不受影响，CORS 只回显白名单内的 Origin，绝不使用 `*`。
 - **重要**：拿到客户端 Token 或完整 Gemini Capability URL 的调用方，对每个 `mode: "direct"` 项目约等于拥有本机用户的代码执行能力——可先 `apply_patch` 修改 `package.json`，再 `exec_verify` 调 `sdk.npm.run` 执行。只给受信任的 AI/节点授权；反向代理必须避免把 `/mcp/<密钥>` 完整路径写入访问日志。
 - `readonly` 仅阻止 `apply_patch` 写盘，**不阻止 `exec_verify`**（其后果取决于启用的 SDK，如 `npm run build` 仍会写产物）。需要严格只读时，请同时把项目 `sdks` 收缩为 `["fs_read"]` 等纯读集合——控制台「本地项目」页签的「严格只读预设」按钮可一键填入该组合。
 - 上级节点的 `/mcp` 凭据持有者可对整棵子树（含全部后代节点的项目）发起工具调用；入网 Token 只决定谁能挂载上来，不约束上级的调用能力。
@@ -203,6 +204,7 @@ ASTRA_HOST_PORT=13939 docker compose up -d   # 宿主机端口默认 3939，可�
 | `ASTRA_PUBLIC_URL` | 公网地址，如 `https://astra.example.com`（VPS 节点必填）；仅作回退，控制台 `publicUrl` 优先 |
 | `ASTRA_UPSTREAM_URL` / `ASTRA_UPSTREAM_TOKEN` | 子节点入网：`wss://<父节点域名>/ws/tree` + 父节点入网 Token；**仅首次启动播种** |
 | `ASTRA_MCP_PATH_TOKEN` | 可选：固定 Gemini 路径密钥；缺省时入口脚本生成/读取 `/data/mcp-path.txt` |
+| `ASTRA_MCP_ALLOWED_ORIGINS` | 可选：额外允许访问 `/mcp` 的浏览器 Origin，逗号分隔（尾随 `/` 自动忽略） |
 
 VPS 侧与方案 A 等价：`.env` 设 `ASTRA_PUBLIC_URL=https://<域名>`，Caddy `reverse_proxy 127.0.0.1:3939`。本地子节点 `.env` 设 `ASTRA_UPSTREAM_URL=wss://<域名>/ws/tree` 与 `ASTRA_UPSTREAM_TOKEN=<父节点 join-token>`，经父节点访问其项目写作 `<nodeId>/<project>`（如 `home-docker/demo`）。容器内 UPnP 与 LAN 直连宣告会被强制关闭，树内调用自动走中继。
 

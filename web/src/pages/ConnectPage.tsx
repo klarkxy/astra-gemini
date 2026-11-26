@@ -74,7 +74,10 @@ export function ConnectPage() {
   const mcpPathEnabled = status.mcpPathEnabled !== false;
   const fallbackBase = (status.publicUrl || status.localMcpUrl.replace(/\/mcp\/?$/, "")).replace(/\/+$/, "");
   const geminiMcpUrl =
-    status.publicGeminiMcpUrl || (status.mcpPathToken ? `${fallbackBase}/mcp/${status.mcpPathToken}` : "");
+    status.publicGeminiMcpUrl ||
+    (status.mcpPathToken && status.mcpPathToken.length >= 32
+      ? `${fallbackBase}/mcp/${encodeURIComponent(status.mcpPathToken)}`
+      : "");
   const rotatingRow = SECRET_ROWS.find((r) => r.kind === rotating);
 
   async function doRotate() {

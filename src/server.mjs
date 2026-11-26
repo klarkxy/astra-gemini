@@ -19,7 +19,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRIDGE_ROOT = path.resolve(__dirname, "..");
 const UI_HTML_PATH = path.join(__dirname, "ui.html");
 
-const SUPPORTED_MCP_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const SUPPORTED_MCP_VERSIONS = ["2025-06-18", "2025-03-26"];
 const DEFAULT_MCP_VERSION = "2025-03-26";
 const SERVER_INFO = { name: "astra-gemini", version: "0.1.0" };
 const ADMIN_WINDOW_MS = 10 * 60 * 1000;
@@ -29,12 +29,6 @@ const PUBLIC_UI_HEADERS = {
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
   "Cache-Control": "no-store"
-};
-const MCP_CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version",
-  "Access-Control-Max-Age": "86400"
 };
 
 const SERVER_INSTRUCTIONS = [
@@ -123,7 +117,7 @@ const TOOLS = [
   {
     name: "exec_verify",
     description: "Execute a short async JS verification script in a permission-sandboxed process on the target node with ONLY its enabled `sdk` namespace. Every `sdk.*` call crosses IPC and MUST be awaited.",
-    annotations: { title: "Execute Verification Script", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    annotations: { title: "Execute Verification Script", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     inputSchema: {
       type: "object",
       required: ["project", "script"],
@@ -344,6 +338,37 @@ export function createBridgeServer(options = {}) {
     return configured ? configured.replace(/\/+$/, "") : "";
   }
 
+  function mcpOriginAllowed(req) {
+    const origin = req?.headers?.origin;
+    if (origin === undefined) return true;
+    const allowed = new Set(["https://gemini.google.com"]);
+    const pub = configuredPublicUrl();
+    if (pub && URL.canParse(pub)) {
+      allowed.add(new URL(pub).origin);
+    }
+    const extraOrigins = Array.isArray(options.mcpAllowedOrigins)
+      ? options.mcpAllowedOrigins
+      : String(process.env.ASTRA_MCP_ALLOWED_ORIGINS || "").split(",");
+    for (const entry of extraOrigins) {
+      const normalized = String(entry).trim().replace(/\/+$/, "");
+      if (normalized) allowed.add(normalized);
+    }
+    return allowed.has(String(origin));
+  }
+
+  function mcpCorsHeaders(req) {
+    const headers = {
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version",
+      "Access-Control-Max-Age": "86400",
+      Vary: "Origin"
+    };
+    if (req?.headers?.origin !== undefined && mcpOriginAllowed(req)) {
+      headers["Access-Control-Allow-Origin"] = String(req.headers.origin);
+    }
+    return headers;
+  }
+
   // 公网控制台：options 优先，settings.publicConsole 次之，最后回退 ASTRA_PUBLIC_CONSOLE=1；
   // 同时需已配置公网地址。
   function publicConsoleUrl() {
@@ -483,6 +508,14 @@ export function createBridgeServer(options = {}) {
       return respond(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } });
     }
     const { id = null, method, params } = msg || {};
+    const mcpProtocolVersion = headers["mcp-protocol-version"];
+    if (method !== "initialize" && mcpProtocolVersion !== undefined && !SUPPORTED_MCP_VERSIONS.includes(mcpProtocolVersion)) {
+      return respond(400, {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32600, message: `Unsupported MCP-Protocol-Version: ${mcpProtocolVersion}` }
+      });
+    }
     if (method === "notifications/initialized" || (id === null && method?.startsWith("notifications/"))) {
       return { status: 202, headers: {}, bodyText: "" };
     }
@@ -701,8 +734,8 @@ export function createBridgeServer(options = {}) {
             mcpPathToken,
             mcpPathEnabled: safeSettings.mcpPathEnabled !== false,
             publicGeminiMcpUrl:
-              configuredPublicUrl() && mcpPathToken && safeSettings.mcpPathEnabled !== false
-                ? `${configuredPublicUrl()}/mcp/${mcpPathToken}`
+              configuredPublicUrl() && mcpPathToken.length >= 32 && safeSettings.mcpPathEnabled !== false
+                ? `${configuredPublicUrl()}/mcp/${encodeURIComponent(mcpPathToken)}`
                 : null,
             publicConsole: Boolean(publicConsoleUrl()),
             rotatable: {
@@ -963,8 +996,13 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
+    if (!mcpOriginAllowed(req)) {
+      sendJson(req, res, 403, { error: "Forbidden origin." });
+      return;
+    }
+
     if (req.method === "OPTIONS") {
-      res.writeHead(204, { Allow: "POST, OPTIONS", ...MCP_CORS_HEADERS });
+      res.writeHead(204, { Allow: "POST, OPTIONS", ...mcpCorsHeaders(req) });
       res.end();
       return;
     }
@@ -979,7 +1017,7 @@ export function createBridgeServer(options = {}) {
     if (req.method !== "POST") {
       sendJson(req, res, 405, { error: "Method not allowed. Use POST." }, {
         Allow: "POST, OPTIONS",
-        ...MCP_CORS_HEADERS
+        ...mcpCorsHeaders(req)
       });
       return;
     }
@@ -996,7 +1034,7 @@ export function createBridgeServer(options = {}) {
       bodyText: mcpBody,
       preAuthorized: isPathSecretMcp
     });
-    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, { ...MCP_CORS_HEADERS, ...mcpRes.headers });
+    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, { ...mcpCorsHeaders(req), ...mcpRes.headers });
   });
 
   serverRef = server;

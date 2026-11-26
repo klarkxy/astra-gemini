@@ -21,17 +21,22 @@ function normalizeExpectedHashes(input) {
     try {
       val = JSON.parse(val);
     } catch {
-      return null;
+      throw new Error("Invalid expectedHashes: not valid JSON.");
     }
   }
   if (Array.isArray(val)) {
     const out = Object.create(null);
     for (const item of val) {
-      if (!item || typeof item !== "object" || typeof item.path !== "string" || !item.path.trim()) continue;
+      if (!item || typeof item !== "object" || typeof item.path !== "string" || !item.path.trim()) {
+        throw new Error("Invalid expectedHashes entry: missing path.");
+      }
       const rel = item.path.replace(/\\/g, "/").replace(/^\.\//, "");
-      if (item.exists === false || item.hash === null || item.hash === "") {
+      if (item.exists === false) {
         out[rel] = null;
-      } else if (typeof item.hash === "string") {
+      } else {
+        if (typeof item.hash !== "string" || !item.hash.trim()) {
+          throw new Error(`Invalid expectedHashes entry for "${rel}": hash is required unless exists is false.`);
+        }
         out[rel] = item.hash;
       }
     }
