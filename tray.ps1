@@ -26,6 +26,7 @@ function Get-OrCreateToken([string]$fileName) {
 $token = Get-OrCreateToken "token.txt"
 $joinToken = Get-OrCreateToken "join-token.txt"
 $adminKey = Get-OrCreateToken "admin-key.txt"
+$mcpPathToken = Get-OrCreateToken "mcp-path.txt"
 
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, "Local\AstraGeminiTrayMutex", [ref]$createdNew)
@@ -78,6 +79,7 @@ function Start-Bridge {
   $psi.EnvironmentVariables["ASTRA_TOKEN"] = $token
   $psi.EnvironmentVariables["ASTRA_JOIN_TOKEN"] = $joinToken
   $psi.EnvironmentVariables["ASTRA_ADMIN_KEY"] = $adminKey
+  $psi.EnvironmentVariables["ASTRA_MCP_PATH_TOKEN"] = $mcpPathToken
   $script:nodeProc = [System.Diagnostics.Process]::Start($psi)
   Update-TrayUi
 }

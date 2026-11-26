@@ -31,6 +31,12 @@ if [ -z "$ASTRA_ADMIN_KEY" ]; then
 fi
 export ASTRA_ADMIN_KEY
 
+if [ -z "$ASTRA_MCP_PATH_TOKEN" ]; then
+  [ -f "$DATA/mcp-path.txt" ] || gen_hex > "$DATA/mcp-path.txt"
+  ASTRA_MCP_PATH_TOKEN=$(cat "$DATA/mcp-path.txt")
+fi
+export ASTRA_MCP_PATH_TOKEN
+
 if [ ! -f "$DATA/projects.json" ]; then
   cp /app/docker/projects.default.json "$DATA/projects.json"
 fi

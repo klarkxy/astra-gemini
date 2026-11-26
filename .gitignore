@@ -13,6 +13,7 @@ node_modules/
 Thumbs.db
 join-token.txt
 admin-key.txt
+mcp-path.txt
 nodes.json
 oauth-state.json
 identity.json

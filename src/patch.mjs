@@ -15,6 +15,34 @@ function timingSafeHexEqual(a, b) {
   return crypto.timingSafeEqual(ba, bb);
 }
 
+function normalizeExpectedHashes(input) {
+  let val = input;
+  if (typeof val === "string" && val.trim()) {
+    try {
+      val = JSON.parse(val);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(val)) {
+    const out = Object.create(null);
+    for (const item of val) {
+      if (!item || typeof item !== "object" || typeof item.path !== "string" || !item.path.trim()) continue;
+      const rel = item.path.replace(/\\/g, "/").replace(/^\.\//, "");
+      if (item.exists === false || item.hash === null || item.hash === "") {
+        out[rel] = null;
+      } else if (typeof item.hash === "string") {
+        out[rel] = item.hash;
+      }
+    }
+    return out;
+  }
+  if (val && typeof val === "object") {
+    return val;
+  }
+  return null;
+}
+
 export function parsePatchPaths(patchText) {
   const paths = new Set();
   const lines = patchText.split(/\r?\n/);
@@ -155,8 +183,9 @@ export function applyPatch(bridgeRoot, projectCfg, opts = {}) {
     }
   }
 
-  if (expectedHashes && typeof expectedHashes === "object" && !Array.isArray(expectedHashes)) {
-    for (const [rawRel, expHash] of Object.entries(expectedHashes)) {
+  const expectedMap = normalizeExpectedHashes(expectedHashes);
+  if (expectedMap) {
+    for (const [rawRel, expHash] of Object.entries(expectedMap)) {
       const rel = rawRel.replace(/\\/g, "/").replace(/^\.\//, "");
       const abs = resolveSafePath(projectCfg.root, rel);
       const exists = fs.existsSync(abs);

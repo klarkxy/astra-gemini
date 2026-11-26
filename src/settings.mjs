@@ -14,7 +14,7 @@ export const DEFAULT_SETTINGS = {
   port: 3939,
   authMode: "bearer",
   publicUrl: "",
-  gatewayUrl: "",
+  mcpPathEnabled: true,
   directEnabled: true,
   advertiseLan: true,
   upstream: {

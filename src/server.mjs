@@ -19,7 +19,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_BRIDGE_ROOT = path.resolve(__dirname, "..");
 const UI_HTML_PATH = path.join(__dirname, "ui.html");
 
-const MCP_PROTOCOL_VERSION = "2025-03-26";
+const SUPPORTED_MCP_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const DEFAULT_MCP_VERSION = "2025-03-26";
 const SERVER_INFO = { name: "astra-gemini", version: "0.1.0" };
 const ADMIN_WINDOW_MS = 10 * 60 * 1000;
 const ADMIN_FAIL_LIMIT = 10;
@@ -29,18 +30,32 @@ const PUBLIC_UI_HEADERS = {
   "Referrer-Policy": "no-referrer",
   "Cache-Control": "no-store"
 };
+const MCP_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version",
+  "Access-Control-Max-Age": "86400"
+};
+
+const SERVER_INSTRUCTIONS = [
+  "Astra Gemini is a multi-node local and subtree codebase bridge.",
+  "1. Call list_projects first to discover local aliases and online '<nodeId>/<project>' subtree projects.",
+  "2. Call pull_snapshot to inspect files (use paths globs or includeContent=false first on unfamiliar repos; pass knownHashes=[{path,hash}] on repeat pulls to skip unchanged files).",
+  "3. Call apply_patch with a standard unified diff ('--- a/path', '+++ b/path') and optional expectedHashes=[{path,hash,exists}] optimistic locking. Automatic rollback backups are created before patching.",
+  "4. Call list_sdks to inspect enabled verification SDKs, then exec_verify to run git/test/build/fs_read checks in a sandboxed process. Every sdk.<name>.<fn>(...) call returns a Promise and MUST be awaited."
+].join("\n");
 
 const TOOLS = [
   {
     name: "list_projects",
     description: "List all registered local projects and online subtree projects across connected Astra Gemini nodes.",
-    annotations: { readOnlyHint: true },
+    annotations: { title: "List Projects", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: { type: "object", properties: {} }
   },
   {
     name: "pull_snapshot",
-    description: "Pull a filtered text code snapshot with bundleSha256 and optional incremental deduplication via knownHashes (SHA-256 or MD5).",
-    annotations: { readOnlyHint: true },
+    description: "Pull a filtered text code snapshot with bundleSha256 and optional incremental deduplication via knownHashes.",
+    annotations: { title: "Pull Code Snapshot", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       required: ["project"],
@@ -48,11 +63,19 @@ const TOOLS = [
         project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
         paths: { type: "array", items: { type: "string" }, description: "Optional glob/path filters for incremental pull." },
         knownHashes: {
-          type: "object",
-          description: "Optional map of { relPath: sha256OrMd5Hex } already cached by caller; unchanged files are skipped and removed files are reported in `deleted`."
+          type: "array",
+          description: "Optional cached file hashes; unchanged files are omitted from `files` and deleted files are listed in `deleted`.",
+          items: {
+            type: "object",
+            required: ["path", "hash"],
+            properties: {
+              path: { type: "string", description: "Project-relative file path." },
+              hash: { type: "string", description: "SHA-256 or MD5 hex digest." }
+            }
+          }
         },
-        includeContent: { type: "boolean", description: "Include file contents (default true; set false to list paths/hashes only)." },
-        maxFiles: { type: "number", description: "Max files to return (default 200)." },
+        includeContent: { type: "boolean", description: "Include file contents (default true; set false to list paths and hashes only)." },
+        maxFiles: { type: "number", description: "Max files to scan (default 200)." },
         maxTotalBytes: { type: "number", description: "Max total UTF-8 bytes to return (default 2000000)." }
       }
     }
@@ -60,26 +83,35 @@ const TOOLS = [
   {
     name: "apply_patch",
     description: "Validate (optional patchSha256 + expectedHashes optimistic lock + git apply --check), auto-backup, apply a unified diff patch, and return postHashes.",
-    annotations: { readOnlyHint: false, destructiveHint: true },
+    annotations: { title: "Apply Unified Diff Patch", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       type: "object",
       required: ["project", "patch"],
       properties: {
         project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
         patch: { type: "string", description: "Unified diff patch content." },
-        patchSha256: { type: "string", description: "Optional SHA-256 (or MD5) checksum of the patch text to verify transport integrity." },
+        patchSha256: { type: "string", description: "Optional SHA-256 (or MD5) hex checksum of the patch text." },
         expectedHashes: {
-          type: "object",
-          description: "Optional optimistic lock map { relPath: sha256OrMd5Hex | null }; rejects patch if local files diverged."
+          type: "array",
+          description: "Optional optimistic lock entries; rejects patch if local files diverged.",
+          items: {
+            type: "object",
+            required: ["path"],
+            properties: {
+              path: { type: "string", description: "Project-relative file path." },
+              hash: { type: "string", description: "Expected SHA-256 or MD5 hex digest before patching." },
+              exists: { type: "boolean", description: "Set false to assert a newly created file does not exist yet (default true)." }
+            }
+          }
         },
-        dryRun: { type: "boolean", description: "If true, only validate without modifying files." }
+        dryRun: { type: "boolean", description: "If true, validate without modifying files on disk." }
       }
     }
   },
   {
     name: "list_sdks",
     description: "Hot-reload and list all verification SDKs currently enabled for a local or subtree project.",
-    annotations: { readOnlyHint: true },
+    annotations: { title: "List Verification SDKs", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       required: ["project"],
@@ -90,14 +122,14 @@ const TOOLS = [
   },
   {
     name: "exec_verify",
-    description: "Execute a short async JS verification script in a permission-sandboxed process on the target node with ONLY its enabled `sdk` namespace. Every `sdk.*` call crosses an IPC boundary and returns a Promise, so all calls must be awaited.",
-    annotations: { readOnlyHint: false },
+    description: "Execute a short async JS verification script in a permission-sandboxed process on the target node with ONLY its enabled `sdk` namespace. Every `sdk.*` call crosses IPC and MUST be awaited.",
+    annotations: { title: "Execute Verification Script", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       type: "object",
       required: ["project", "script"],
       properties: {
         project: { type: "string", description: "Project alias (or '<childNode>/<project>' for subtree nodes)." },
-        script: { type: "string", description: "Async JS body using `await sdk.<name>.<fn>(...)` (all sdk calls return Promises) and returning a compact summary." },
+        script: { type: "string", description: "Async JS body using `await sdk.<name>.<fn>(...)` and returning a compact JSON-serializable summary." },
         timeoutMs: { type: "number", description: "Execution timeout in ms (default 30000, max 120000)." },
         maxOutputBytes: { type: "number", description: "Output/log cap in bytes (default 8192)." }
       }
@@ -129,6 +161,11 @@ function sendJson(req, res, status, obj, extraHeaders = {}) {
 }
 
 function sendRaw(req, res, status, bodyText, extraHeaders = {}) {
+  if (!bodyText) {
+    res.writeHead(status, { "Content-Length": 0, ...extraHeaders });
+    res.end();
+    return;
+  }
   const rawBuf = Buffer.from(String(bodyText), "utf8");
   const acceptEnc = String(req?.headers?.["accept-encoding"] || "");
   if (rawBuf.length > 1024 && /\bgzip\b/i.test(acceptEnc)) {
@@ -164,6 +201,14 @@ async function readBody(req, maxBytes = 10 * 1024 * 1024) {
     return zlib.gunzipSync(raw).toString("utf8");
   }
   return raw.toString("utf8");
+}
+
+function readSecretFileIfPresent(dir, name) {
+  try {
+    return fs.readFileSync(path.join(dir, name), "utf8").trim();
+  } catch {
+    return "";
+  }
 }
 
 function isDirectLocalhost(req) {
@@ -213,6 +258,11 @@ export function createBridgeServer(options = {}) {
   let authToken = options.authToken ?? process.env.ASTRA_TOKEN ?? process.env.KIMI_BRIDGE_TOKEN ?? "";
   let joinToken = options.joinToken ?? process.env.ASTRA_JOIN_TOKEN ?? "";
   let adminKey = options.adminKey ?? process.env.ASTRA_ADMIN_KEY ?? "";
+  let mcpPathToken = options.mcpPathToken ?? process.env.ASTRA_MCP_PATH_TOKEN;
+  if (mcpPathToken === undefined) {
+    mcpPathToken = readSecretFileIfPresent(bridgeRoot, "mcp-path.txt");
+  }
+  mcpPathToken = String(mcpPathToken || "").trim();
   const fixedNodeId = options.nodeId || null;
   hardenSecretFiles(bridgeRoot);
   const startedAt = Date.now();
@@ -320,7 +370,8 @@ export function createBridgeServer(options = {}) {
   const SECRET_ROTATION = {
     client: { file: "token.txt", needsBearer: true, current: () => authToken, set: (v) => { authToken = v; } },
     join: { file: "join-token.txt", needsBearer: false, current: () => joinToken, set: (v) => { joinToken = v; } },
-    admin: { file: "admin-key.txt", needsBearer: true, current: () => effectiveAdminKey(), set: (v) => { adminKey = v; } }
+    admin: { file: "admin-key.txt", needsBearer: true, current: () => effectiveAdminKey(), set: (v) => { adminKey = v; } },
+    mcpPath: { file: "mcp-path.txt", needsBearer: true, current: () => mcpPathToken, set: (v) => { mcpPathToken = v; } }
   };
 
   function secretRotatable(kind) {
@@ -414,13 +465,13 @@ export function createBridgeServer(options = {}) {
     tree.connectUpstream(initialUpstream);
   }
 
-  async function handleMcp({ headers = {}, bodyText = "" } = {}) {
+  async function handleMcp({ headers = {}, bodyText = "", preAuthorized = false } = {}) {
     const respond = (status, obj, extraHeaders = {}) => ({
       status,
       headers: extraHeaders,
       bodyText: JSON.stringify(obj)
     });
-    if (!isClientAuthorized({ headers })) {
+    if (!preAuthorized && !isClientAuthorized({ headers })) {
       return respond(401, { error: "Unauthorized" }, {
         "WWW-Authenticate": `Bearer realm="astra-gemini"`
       });
@@ -438,13 +489,16 @@ export function createBridgeServer(options = {}) {
     try {
       if (method === "initialize") {
         recordLog("MCP 握手", "客户端已连接");
+        const reqVer = typeof params?.protocolVersion === "string" ? params.protocolVersion : "";
+        const protocolVersion = SUPPORTED_MCP_VERSIONS.includes(reqVer) ? reqVer : DEFAULT_MCP_VERSION;
         return respond(200, {
           jsonrpc: "2.0",
           id,
           result: {
-            protocolVersion: MCP_PROTOCOL_VERSION,
+            protocolVersion,
             capabilities: { tools: {} },
-            serverInfo: SERVER_INFO
+            serverInfo: SERVER_INFO,
+            instructions: SERVER_INSTRUCTIONS
           }
         });
       }
@@ -460,12 +514,13 @@ export function createBridgeServer(options = {}) {
         recordLog("MCP 调用", `${toolName}${toolArgs.project ? ` (${toolArgs.project})` : ""}`);
         try {
           const data = await tree.routeToolCall(toolName, toolArgs);
+          const isPlainObj = data !== null && typeof data === "object" && !Array.isArray(data);
           return respond(200, {
             jsonrpc: "2.0",
             id,
             result: {
               content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-              structuredContent: data,
+              ...(isPlainObj ? { structuredContent: data } : {}),
               isError: data?.ok === false
             }
           });
@@ -643,11 +698,18 @@ export function createBridgeServer(options = {}) {
             hasJoinToken: Boolean(joinToken) || authMode === "none",
             publicUrl: getPublicBase(req),
             publicMcpUrl: configuredPublicUrl() ? `${configuredPublicUrl()}/mcp` : null,
+            mcpPathToken,
+            mcpPathEnabled: safeSettings.mcpPathEnabled !== false,
+            publicGeminiMcpUrl:
+              configuredPublicUrl() && mcpPathToken && safeSettings.mcpPathEnabled !== false
+                ? `${configuredPublicUrl()}/mcp/${mcpPathToken}`
+                : null,
             publicConsole: Boolean(publicConsoleUrl()),
             rotatable: {
               client: secretRotatable("client"),
               join: secretRotatable("join"),
-              admin: secretRotatable("admin")
+              admin: secretRotatable("admin"),
+              mcpPath: secretRotatable("mcpPath")
             },
             uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
             settings: safeSettings,
@@ -666,7 +728,7 @@ export function createBridgeServer(options = {}) {
           const kind = String(body?.kind || "");
           const spec = SECRET_ROTATION[kind];
           if (!spec) {
-            sendJson(req, res, 400, { ok: false, error: "未知密钥类型，应为 client/join/admin。" });
+            sendJson(req, res, 400, { ok: false, error: "未知密钥类型，应为 client/join/admin/mcpPath。" });
             return;
           }
           if (!secretRotatable(kind)) {
@@ -678,65 +740,6 @@ export function createBridgeServer(options = {}) {
           spec.set(value);
           recordLog("密钥轮换", kind);
           sendJson(req, res, 200, { ok: true, kind, value });
-          return;
-        }
-
-        if (req.method === "POST" && url.pathname === "/api/gateway/check") {
-          const body = JSON.parse(await readBody(req));
-          const raw = typeof body?.url === "string" && body.url.trim()
-            ? body.url
-            : loadSettings(bridgeRoot).gatewayUrl || "";
-          const base = String(raw).trim().replace(/\/+$/, "").replace(/\/mcp$/i, "").replace(/\/+$/, "");
-          let parsed = null;
-          try {
-            parsed = base ? new URL(base) : null;
-          } catch {
-            parsed = null;
-          }
-          const isLocal = parsed && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
-          if (!parsed || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && isLocal))) {
-            sendJson(req, res, 400, { ok: false, error: "网关地址无效：需 https:// 地址（仅本机测试可用 http://127.0.0.1）。" });
-            return;
-          }
-          const checks = [];
-          const gwFetch = (u, init = {}) => fetch(u, { ...init, redirect: "manual", signal: AbortSignal.timeout(8000) });
-          const push = (name, ok, detail) => checks.push({ name, ok, detail });
-          try {
-            const r = await gwFetch(`${base}/.well-known/oauth-authorization-server`);
-            if (r.status !== 200) {
-              push("授权服务发现", false, `HTTP ${r.status}`);
-            } else {
-              const doc = await r.json().catch(() => null);
-              const okMeta = doc && doc.authorization_endpoint && doc.token_endpoint;
-              push("授权服务发现", Boolean(okMeta), okMeta ? "HTTP 200，端点齐全" : "响应缺少 authorization_endpoint/token_endpoint");
-            }
-          } catch (err) {
-            push("授权服务发现", false, `网络错误：${err.message}`);
-          }
-          try {
-            const r = await gwFetch(`${base}/.well-known/oauth-protected-resource/mcp`);
-            if (r.status !== 200) {
-              push("受保护资源元数据", false, `HTTP ${r.status}`);
-            } else {
-              const doc = await r.json().catch(() => null);
-              const expected = `${base}/mcp`;
-              const okMeta = doc && doc.resource === expected;
-              push("受保护资源元数据", Boolean(okMeta), okMeta ? `HTTP 200，resource=${expected}` : `resource 不匹配：${doc?.resource ?? "(缺失)"}`);
-            }
-          } catch (err) {
-            push("受保护资源元数据", false, `网络错误：${err.message}`);
-          }
-          try {
-            const r = await gwFetch(`${base}/mcp`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })
-            });
-            push("MCP 需鉴权", r.status === 401, r.status === 401 ? "HTTP 401" : `期望 401，实际 HTTP ${r.status}`);
-          } catch (err) {
-            push("MCP 需鉴权", false, `网络错误：${err.message}`);
-          }
-          sendJson(req, res, 200, { ok: checks.every((c) => c.ok), base, checks });
           return;
         }
 
@@ -818,7 +821,7 @@ export function createBridgeServer(options = {}) {
           if (typeof body.advertiseLan === "boolean") patch.advertiseLan = body.advertiseLan;
           if (typeof body.publicUrl === "string") patch.publicUrl = body.publicUrl.trim();
           if (typeof body.publicConsole === "boolean") patch.publicConsole = body.publicConsole;
-          if (typeof body.gatewayUrl === "string") patch.gatewayUrl = body.gatewayUrl.trim();
+          if (typeof body.mcpPathEnabled === "boolean") patch.mcpPathEnabled = body.mcpPathEnabled;
           if (body.p2p && typeof body.p2p === "object") {
             const p2p = { ...(loadSettings(bridgeRoot).p2p || {}) };
             if (typeof body.p2p.enabled === "boolean") p2p.enabled = body.p2p.enabled;
@@ -935,12 +938,38 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
-    if (url.pathname !== "/mcp") {
+    const trimmedPath = url.pathname.replace(/\/+$/, "") || "/";
+    const isBearerMcp = trimmedPath === "/mcp";
+    let isPathSecretMcp = false;
+
+    if (!isBearerMcp && trimmedPath.startsWith("/mcp/")) {
+      const seg = trimmedPath.slice("/mcp/".length);
+      if (seg && !seg.includes("/")) {
+        let decoded = "";
+        try {
+          decoded = decodeURIComponent(seg);
+        } catch {
+          decoded = "";
+        }
+        const pathEnabled = loadSettings(bridgeRoot).mcpPathEnabled !== false;
+        if (pathEnabled && mcpPathToken.length >= 32 && tokenEqual(mcpPathToken, decoded)) {
+          isPathSecretMcp = true;
+        }
+      }
+    }
+
+    if (!isBearerMcp && !isPathSecretMcp) {
       sendJson(req, res, 404, { error: "Not found. Use POST /mcp, WS /ws/tree, WS /ws/direct, GET /health, or open /ui on localhost." });
       return;
     }
 
-    if (!isClientAuthorized(req)) {
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, { Allow: "POST, OPTIONS", ...MCP_CORS_HEADERS });
+      res.end();
+      return;
+    }
+
+    if (isBearerMcp && !isClientAuthorized(req)) {
       sendJson(req, res, 401, { error: "Unauthorized" }, {
         "WWW-Authenticate": `Bearer realm="astra-gemini"`
       });
@@ -948,7 +977,10 @@ export function createBridgeServer(options = {}) {
     }
 
     if (req.method !== "POST") {
-      sendJson(req, res, 405, { error: "Method not allowed. Use POST /mcp." });
+      sendJson(req, res, 405, { error: "Method not allowed. Use POST." }, {
+        Allow: "POST, OPTIONS",
+        ...MCP_CORS_HEADERS
+      });
       return;
     }
 
@@ -959,8 +991,12 @@ export function createBridgeServer(options = {}) {
       sendJson(req, res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } });
       return;
     }
-    const mcpRes = await handleMcp({ headers: req.headers, bodyText: mcpBody });
-    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, mcpRes.headers);
+    const mcpRes = await handleMcp({
+      headers: req.headers,
+      bodyText: mcpBody,
+      preAuthorized: isPathSecretMcp
+    });
+    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, { ...MCP_CORS_HEADERS, ...mcpRes.headers });
   });
 
   serverRef = server;

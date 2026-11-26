@@ -418,7 +418,7 @@ test("Astra Gemini 3-tier Direct-First Tunnel Upgrade (>10KB WS gzip payload) + 
 
     const propagated = await waitUntil(async () => {
       const res = await rpc(rootUrl, "r-tok", "tools/call", { name: "list_projects", arguments: {} });
-      return (res.body.result.structuredContent || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
+      return (JSON.parse(res.body.result.content[0].text) || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
     });
     assert.equal(propagated, true);
 
@@ -495,7 +495,7 @@ test("Astra Gemini 3-tier Automatic Relay Fallback when Direct Tunnel candidates
   try {
     const propagated = await waitUntil(async () => {
       const res = await rpc(rootUrl, "r-tok", "tools/call", { name: "list_projects", arguments: {} });
-      return (res.body.result.structuredContent || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
+      return (JSON.parse(res.body.result.content[0].text) || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
     });
     assert.equal(propagated, true);
 
@@ -670,6 +670,222 @@ test("Astra Gemini MCP auth: Bearer-only, OAuth endpoints all 404", async () => 
     });
     assert.equal(ok.status, 200);
     assert.equal((await ok.json()).result.serverInfo.name, "astra-gemini");
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Gemini schema & protocol hygiene: version negotiation, instructions, explicit object schemas, array structuredContent omission", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-gemini-schema-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "schema",
+    authMode: "bearer",
+    authToken: "schema-tok"
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const init = await rpc(base, "schema-tok", "initialize", { protocolVersion: "2025-06-18" });
+    assert.equal(init.status, 200);
+    assert.equal(init.body.result.protocolVersion, "2025-06-18");
+    assert.equal(init.body.result.serverInfo.name, "astra-gemini");
+    assert.match(init.body.result.instructions, /list_projects/);
+    assert.match(init.body.result.instructions, /apply_patch/);
+
+    const initFallback = await rpc(base, "schema-tok", "initialize", { protocolVersion: "1999-01-01" });
+    assert.equal(initFallback.body.result.protocolVersion, "2025-03-26");
+
+    const listed = await rpc(base, "schema-tok", "tools/list");
+    assert.equal(listed.status, 200);
+    const tools = listed.body.result.tools || [];
+    assert.equal(tools.length, 5);
+    const problems = [];
+    const walk = (node, at) => {
+      if (Array.isArray(node)) {
+        node.forEach((item, i) => walk(item, `${at}[${i}]`));
+        return;
+      }
+      if (!node || typeof node !== "object") return;
+      if (node.type === "object" && !Object.prototype.hasOwnProperty.call(node, "properties")) {
+        problems.push(`${at}: bare object`);
+      }
+      for (const key of ["$ref", "$defs"]) {
+        if (Object.prototype.hasOwnProperty.call(node, key)) problems.push(`${at}: ${key}`);
+      }
+      for (const [k, v] of Object.entries(node)) walk(v, `${at}.${k}`);
+    };
+    for (const tool of tools) walk(tool.inputSchema, tool.name);
+    assert.deepEqual(problems, []);
+
+    const projects = await rpc(base, "schema-tok", "tools/call", { name: "list_projects", arguments: {} });
+    assert.equal(projects.status, 200);
+    assert.equal(Object.prototype.hasOwnProperty.call(projects.body.result, "structuredContent"), false);
+    assert.equal(Array.isArray(JSON.parse(projects.body.result.content[0].text)), true);
+
+    const notif = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer schema-tok" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })
+    });
+    assert.equal(notif.status, 202);
+    assert.equal(notif.headers.get("content-length"), "0");
+    assert.equal(await notif.text(), "");
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Gemini dual-format hashes: array/JSON-string knownHashes and expectedHashes optimistic locks", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-dualhash-"));
+  const repo = path.join(tmpBase, "repo");
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  initTempGitRepo(repo);
+
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: repo, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    projectsConfigPath: projectsConfig,
+    nodeId: "dual",
+    authMode: "bearer",
+    authToken: "dual-tok"
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const snap0 = (await rpc(base, "dual-tok", "tools/call", {
+      name: "pull_snapshot",
+      arguments: { project: "demo", includeContent: false }
+    })).body.result.structuredContent;
+    const entries = snap0.files.map((f) => ({ path: f.path, hash: f.sha256 }));
+    entries.push({ path: "ghost/removed.js", hash: "0".repeat(64) });
+
+    for (const knownHashes of [entries, JSON.stringify(entries)]) {
+      const snap = (await rpc(base, "dual-tok", "tools/call", {
+        name: "pull_snapshot",
+        arguments: { project: "demo", includeContent: false, knownHashes }
+      })).body.result.structuredContent;
+      assert.equal(snap.changedCount, 0);
+      assert.equal(snap.unchangedCount, snap0.fileCount);
+      assert.deepEqual(snap.deleted, ["ghost/removed.js"]);
+    }
+
+    const appSha = entries.find((e) => e.path === "app.js").hash;
+    const createPatch = "--- /dev/null\n+++ b/new.js\n@@ -0,0 +1 @@\n+export const created = 1;\n";
+    const lockEntries = [
+      { path: "new.js", exists: false },
+      { path: "app.js", hash: appSha }
+    ];
+    for (const expectedHashes of [lockEntries, JSON.stringify(lockEntries)]) {
+      const okLock = (await rpc(base, "dual-tok", "tools/call", {
+        name: "apply_patch",
+        arguments: { project: "demo", patch: createPatch, expectedHashes, dryRun: true }
+      })).body.result.structuredContent;
+      assert.equal(okLock.ok, true, okLock.error);
+      assert.equal(okLock.dryRun, true);
+    }
+
+    const badHash = (await rpc(base, "dual-tok", "tools/call", {
+      name: "apply_patch",
+      arguments: { project: "demo", patch: createPatch, expectedHashes: [{ path: "app.js", hash: "0".repeat(64) }], dryRun: true }
+    })).body.result.structuredContent;
+    assert.equal(badHash.ok, false);
+    assert.match(badHash.error, /Optimistic lock failed/i);
+
+    const badExists = (await rpc(base, "dual-tok", "tools/call", {
+      name: "apply_patch",
+      arguments: { project: "demo", patch: createPatch, expectedHashes: [{ path: "app.js", exists: false }], dryRun: true }
+    })).body.result.structuredContent;
+    assert.equal(badExists.ok, false);
+    assert.match(badExists.error, /not to exist/i);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("Capability URL /mcp/<secret>: no-header access, method hygiene, disable switch and rotation isolation", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-capurl-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+  const initialSecret = "b".repeat(64);
+  fs.writeFileSync(path.join(bridgeState, "mcp-path.txt"), initialSecret, "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "cap",
+    authMode: "bearer",
+    authToken: "client-tok",
+    mcpPathToken: initialSecret
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const initPayload = { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } };
+  const postCap = (secret, payload = initPayload) =>
+    fetch(`${base}/mcp/${encodeURIComponent(secret)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+  try {
+    const st0 = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "client-tok" } }).then((r) => r.json());
+    assert.equal(st0.mcpPathToken, initialSecret);
+    assert.equal(st0.mcpPathEnabled, true);
+    assert.equal(st0.rotatable.mcpPath, true);
+
+    const ok = await postCap(initialSecret);
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).result.serverInfo.name, "astra-gemini");
+
+    const wrong = await postCap("c".repeat(64));
+    assert.equal(wrong.status, 404);
+    assert.equal(wrong.headers.get("www-authenticate"), null);
+
+    const opt = await fetch(`${base}/mcp/${initialSecret}`, { method: "OPTIONS" });
+    assert.equal(opt.status, 204);
+    assert.equal(opt.headers.get("allow"), "POST, OPTIONS");
+    assert.equal(opt.headers.get("access-control-allow-origin"), "*");
+
+    const get = await fetch(`${base}/mcp/${initialSecret}`);
+    assert.equal(get.status, 405);
+    assert.equal(get.headers.get("allow"), "POST, OPTIONS");
+    await get.text();
+
+    const wrongGet = await fetch(`${base}/mcp/${"c".repeat(64)}`);
+    assert.equal(wrongGet.status, 404);
+    await wrongGet.text();
+
+    const notif = await postCap(initialSecret, { jsonrpc: "2.0", method: "notifications/initialized" });
+    assert.equal(notif.status, 202);
+    assert.equal(notif.headers.get("content-length"), "0");
+    assert.equal(await notif.text(), "");
+
+    const off = await adminPost(base, "/api/settings", { mcpPathEnabled: false }, "client-tok");
+    assert.equal(off.status, 200);
+    assert.equal((await postCap(initialSecret)).status, 404);
+    const on = await adminPost(base, "/api/settings", { mcpPathEnabled: true }, "client-tok");
+    assert.equal(on.status, 200);
+    assert.equal((await postCap(initialSecret)).status, 200);
+
+    const rotated = await adminPost(base, "/api/secrets/rotate", { kind: "mcpPath" }, "client-tok");
+    assert.equal(rotated.status, 200);
+    const newSecret = rotated.body.value;
+    assert.match(newSecret, /^[0-9a-f]{64}$/);
+    assert.notEqual(newSecret, initialSecret);
+    assert.equal(fs.readFileSync(path.join(bridgeState, "mcp-path.txt"), "utf8"), newSecret);
+    assert.equal((await postCap(initialSecret)).status, 404);
+    assert.equal((await postCap(newSecret)).status, 200);
+    assert.equal((await rpc(base, "client-tok", "tools/list")).status, 200);
   } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -965,7 +1181,7 @@ test("Astra Gemini relay timeout: relayed exec_verify uses tool timeout + hop gr
   try {
     const propagated = await waitUntil(async () => {
       const res = await rpc(rootUrl, "r-tok", "tools/call", { name: "list_projects", arguments: {} });
-      return (res.body.result.structuredContent || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
+      return (JSON.parse(res.body.result.content[0].text) || []).some((p) => p.project === "branch/leaf/leaf-app" && p.online);
     });
     assert.equal(propagated, true);
 
@@ -1967,6 +2183,7 @@ test("secrets rotate: client/join/admin rotation updates memory + file", async (
   fs.writeFileSync(path.join(bridgeState, "token.txt"), "file-tok", "utf8");
   fs.writeFileSync(path.join(bridgeState, "join-token.txt"), "join-tok", "utf8");
   fs.writeFileSync(path.join(bridgeState, "admin-key.txt"), "admin-secret", "utf8");
+  fs.writeFileSync(path.join(bridgeState, "mcp-path.txt"), "a".repeat(64), "utf8");
 
   const server = createBridgeServer({
     bridgeRoot: bridgeState,
@@ -1981,7 +2198,7 @@ test("secrets rotate: client/join/admin rotation updates memory + file", async (
 
   try {
     const st0 = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "admin-secret" } }).then((r) => r.json());
-    assert.deepEqual(st0.rotatable, { client: true, join: true, admin: true });
+    assert.deepEqual(st0.rotatable, { client: true, join: true, admin: true, mcpPath: true });
 
     const bad = await adminPost(base, "/api/secrets/rotate", { kind: "bogus" }, "admin-secret");
     assert.equal(bad.status, 400);
@@ -2037,7 +2254,7 @@ test("secrets rotate: env-pinned secret -> 409 and rotatable=false", async () =>
     assert.equal(res.status, 409);
     assert.match(res.body.error, /环境变量固定/);
     const st = await fetch(`${base}/api/status`, { headers: { "X-Astra-Admin": "pinned-tok" } }).then((r) => r.json());
-    assert.deepEqual(st.rotatable, { client: false, join: false, admin: false });
+    assert.deepEqual(st.rotatable, { client: false, join: false, admin: false, mcpPath: false });
 
     // 文件存在但内容与当前值不一致（如手动改过文件）→ 仍视为 env 固定
     fs.writeFileSync(path.join(bridgeState, "token.txt"), "different-tok", "utf8");
@@ -2164,93 +2381,6 @@ test("settings.publicUrl takes precedence over ASTRA_PUBLIC_URL env", async () =
   } finally {
     if (prevEnv === undefined) delete process.env.ASTRA_PUBLIC_URL;
     else process.env.ASTRA_PUBLIC_URL = prevEnv;
-    server.close();
-    fs.rmSync(tmpBase, { recursive: true, force: true });
-  }
-});
-
-test("gateway check: discovery + protected-resource + 401 probe against stub", async () => {
-  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-gwck-"));
-  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
-  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
-
-  const token = "gw-tok";
-  const server = createBridgeServer({
-    bridgeRoot: bridgeState,
-    nodeId: "gw",
-    authMode: "bearer",
-    authToken: token
-  });
-  await listenOn(server);
-  const base = `http://127.0.0.1:${server.address().port}`;
-
-  const mkStub = async ({ resource, mcpStatus }) => {
-    const stub = http.createServer((req, res) => {
-      const u = new URL(req.url, "http://x");
-      if (req.method === "GET" && u.pathname === "/.well-known/oauth-authorization-server") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ authorization_endpoint: "https://x/authorize", token_endpoint: "https://x/oauth/token" }));
-        return;
-      }
-      if (req.method === "GET" && u.pathname === "/.well-known/oauth-protected-resource/mcp") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ resource }));
-        return;
-      }
-      if (req.method === "POST" && u.pathname === "/mcp") {
-        res.writeHead(mcpStatus).end();
-        return;
-      }
-      res.writeHead(404).end();
-    });
-    await listenOn(stub);
-    return stub;
-  };
-
-  try {
-    const bad = await mkStub({ resource: "wrong-resource", mcpStatus: 200 });
-    const badBase = `http://127.0.0.1:${bad.address().port}`;
-    const res2 = await adminPost(base, "/api/gateway/check", { url: badBase }, token);
-    assert.equal(res2.status, 200);
-    assert.equal(res2.body.ok, false);
-    assert.equal(res2.body.checks.find((c) => c.name === "授权服务发现").ok, true);
-    assert.equal(res2.body.checks.find((c) => c.name === "受保护资源元数据").ok, false);
-    assert.equal(res2.body.checks.find((c) => c.name === "MCP 需鉴权").ok, false);
-    bad.close();
-
-    // resource 完全匹配 + /mcp 401 → 全部通过；url 带 /mcp 后缀会被归一化
-    let okBase = "";
-    const okStub = http.createServer((req, res) => {
-      const u = new URL(req.url, "http://x");
-      if (u.pathname === "/.well-known/oauth-protected-resource/mcp") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ resource: `${okBase}/mcp` }));
-        return;
-      }
-      if (u.pathname === "/.well-known/oauth-authorization-server") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ authorization_endpoint: "a", token_endpoint: "t" }));
-        return;
-      }
-      if (req.method === "POST" && u.pathname === "/mcp") {
-        res.writeHead(401).end();
-        return;
-      }
-      res.writeHead(404).end();
-    });
-    await listenOn(okStub);
-    okBase = `http://127.0.0.1:${okStub.address().port}`;
-    const res3 = await adminPost(base, "/api/gateway/check", { url: `${okBase}/mcp` }, token);
-    assert.equal(res3.status, 200);
-    assert.equal(res3.body.ok, true, JSON.stringify(res3.body));
-    assert.equal(res3.body.checks.every((c) => c.ok), true);
-    assert.equal(res3.body.base, okBase);
-    okStub.close();
-
-    // 非本机 http 一律拒绝
-    const rejected = await adminPost(base, "/api/gateway/check", { url: "http://203.0.113.10:8080" }, token);
-    assert.equal(rejected.status, 400);
-  } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }
