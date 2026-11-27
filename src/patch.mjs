@@ -15,6 +15,70 @@ function timingSafeHexEqual(a, b) {
   return crypto.timingSafeEqual(ba, bb);
 }
 
+function isPlainObject(val) {
+  if (!val || typeof val !== "object" || Array.isArray(val)) return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+
+function normalizeRelPath(rawPath) {
+  return rawPath.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+}
+
+export function normalizeExpectedHashes(input) {
+  if (input === undefined || input === null) return null;
+  let val = input;
+  if (typeof val === "string") {
+    if (!val.trim()) {
+      throw new Error("Invalid expectedHashes: empty string.");
+    }
+    try {
+      val = JSON.parse(val);
+    } catch {
+      throw new Error("Invalid expectedHashes: not valid JSON.");
+    }
+  }
+  if (Array.isArray(val)) {
+    const out = Object.create(null);
+    for (const item of val) {
+      if (!isPlainObject(item) || typeof item.path !== "string" || !item.path.trim()) {
+        throw new Error("Invalid expectedHashes entry: missing path.");
+      }
+      const rel = normalizeRelPath(item.path.trim());
+      if (!rel) {
+        throw new Error("Invalid expectedHashes entry: missing path.");
+      }
+      if (item.exists === false) {
+        out[rel] = null;
+      } else {
+        if (typeof item.hash !== "string" || !item.hash.trim()) {
+          throw new Error(`Invalid expectedHashes entry for "${rel}": hash is required unless exists is false.`);
+        }
+        out[rel] = item.hash.trim();
+      }
+    }
+    return out;
+  }
+  if (isPlainObject(val)) {
+    const out = Object.create(null);
+    for (const [rawKey, expHash] of Object.entries(val)) {
+      const rel = normalizeRelPath(rawKey.trim());
+      if (!rel) {
+        throw new Error("Invalid expectedHashes entry: empty path key.");
+      }
+      if (expHash === null) {
+        out[rel] = null;
+      } else if (typeof expHash === "string" && expHash.trim()) {
+        out[rel] = expHash.trim();
+      } else {
+        throw new Error(`Invalid expectedHashes entry for "${rel}": expected non-empty hash string or null.`);
+      }
+    }
+    return out;
+  }
+  throw new Error("Invalid expectedHashes: expected an array or plain object.");
+}
+
 export function parsePatchPaths(patchText) {
   const paths = new Set();
   const lines = patchText.split(/\r?\n/);
@@ -155,9 +219,10 @@ export function applyPatch(bridgeRoot, projectCfg, opts = {}) {
     }
   }
 
-  if (expectedHashes && typeof expectedHashes === "object" && !Array.isArray(expectedHashes)) {
-    for (const [rawRel, expHash] of Object.entries(expectedHashes)) {
-      const rel = rawRel.replace(/\\/g, "/").replace(/^\.\//, "");
+  const expectedMap = normalizeExpectedHashes(expectedHashes);
+  if (expectedMap) {
+    for (const [rawRel, expHash] of Object.entries(expectedMap)) {
+      const rel = normalizeRelPath(rawRel);
       const abs = resolveSafePath(projectCfg.root, rel);
       const exists = fs.existsSync(abs);
       if (expHash === null) {

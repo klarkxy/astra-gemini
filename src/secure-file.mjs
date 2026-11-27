@@ -6,6 +6,7 @@ export const SECRET_FILES = [
   "token.txt",
   "join-token.txt",
   "admin-key.txt",
+  "mcp-path.txt",
   "identity.json",
   "settings.json",
   "nodes.json"

@@ -1,5 +1,8 @@
 astra.example.com {
-	reverse_proxy 127.0.0.1:3939
+	log_skip /mcp/*
+	reverse_proxy 127.0.0.1:3939 {
+		flush_interval -1
+	}
 }
 
 # 牵线服务（rendezvous）：单独域名指向 astra-rendezvous.service 的 3941 端口。

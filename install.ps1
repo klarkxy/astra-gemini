@@ -22,7 +22,7 @@ if (-not (Test-Path $projectsFile)) {
 }
 
 $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-foreach ($name in @("token.txt", "join-token.txt", "admin-key.txt")) {
+foreach ($name in @("token.txt", "join-token.txt", "admin-key.txt", "mcp-path.txt")) {
   $tokenFile = Join-Path $root $name
   if (-not (Test-Path $tokenFile)) {
     $bytes = New-Object byte[] 32

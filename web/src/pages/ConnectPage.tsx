@@ -1,10 +1,9 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { adminKeyRemembered, api, setAdminKey } from "@/lib/api";
-import { useSeeded, useStatus } from "@/lib/status";
-import type { GatewayCheckItem } from "@/lib/types";
+import { useStatus } from "@/lib/status";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Block,
   ConfirmDialog,
@@ -18,13 +17,13 @@ import {
 
 const TOKEN_PH = "<客户端 Token>";
 
-type SecretKind = "client" | "join" | "admin";
+type SecretKind = "client" | "join" | "admin" | "mcpPath";
 
 const SECRET_ROWS: { kind: SecretKind; label: string; impact: string }[] = [
   {
     kind: "client",
     label: "客户端 Token",
-    impact: "已接入的代码工具和 Gemini 网关的 UPSTREAM_TOKEN 会失效；轮换后运行 node deploy/gateway.mjs --secrets-only 更新网关。"
+    impact: "已接入的代码工具会失效，需要更新各客户端的 Bearer Token；Gemini Capability URL 不受影响。"
   },
   {
     kind: "join",
@@ -35,23 +34,24 @@ const SECRET_ROWS: { kind: SecretKind; label: string; impact: string }[] = [
     kind: "admin",
     label: "管理密钥",
     impact: "其他浏览器需重新输入管理密钥。"
+  },
+  {
+    kind: "mcpPath",
+    label: "Gemini 路径密钥",
+    impact: "已保存到 Gemini 的免 OAuth URL 会立即失效，需要在 Connected Apps 中更新地址；/mcp Bearer 直连不受影响。"
   }
 ];
 
 export function ConnectPage() {
   const { status, refresh } = useStatus();
   const [showToken, setShowToken] = useState(false);
+  const [showMcpPath, setShowMcpPath] = useState(false);
   const [rotating, setRotating] = useState<SecretKind | null>(null);
-  const [gwUrl, setGwUrl] = useState("");
-  const [gwChecks, setGwChecks] = useState<GatewayCheckItem[] | null>(null);
-  const [gwBusy, setGwBusy] = useState(false);
-
-  useSeeded(status?.settings, () => setGwUrl(status?.settings?.gatewayUrl || ""));
 
   if (!status) {
     return (
       <>
-        <PageHead title="接入客户端" sub="代码工具直连 MCP；Gemini App 经 Cloudflare 网关接入。" />
+        <PageHead title="接入客户端" sub="代码工具直连 MCP；Gemini App 通过免 OAuth 密钥路径接入。" />
         <SkeletonRows />
       </>
     );
@@ -71,7 +71,13 @@ export function ConnectPage() {
     null,
     2
   );
-  const gwBase = (status.settings?.gatewayUrl || "").trim().replace(/\/+$/, "");
+  const mcpPathEnabled = status.mcpPathEnabled !== false;
+  const fallbackBase = (status.publicUrl || status.localMcpUrl.replace(/\/mcp\/?$/, "")).replace(/\/+$/, "");
+  const geminiMcpUrl =
+    status.publicGeminiMcpUrl ||
+    (status.mcpPathToken && status.mcpPathToken.length >= 32
+      ? `${fallbackBase}/mcp/${encodeURIComponent(status.mcpPathToken)}`
+      : "");
   const rotatingRow = SECRET_ROWS.find((r) => r.kind === rotating);
 
   async function doRotate() {
@@ -90,28 +96,15 @@ export function ConnectPage() {
     refresh();
   }
 
-  async function saveGwUrl() {
-    const res = await api.saveSettings({ gatewayUrl: gwUrl.trim() });
-    toast(res.ok ? "网关地址已保存" : res.error || "保存失败");
+  async function saveMcpPathEnabled(enabled: boolean) {
+    const res = await api.saveSettings({ mcpPathEnabled: enabled });
+    toast(res.ok ? (enabled ? "免 OAuth 密钥路径已启用" : "免 OAuth 密钥路径已关闭") : res.error || "保存失败");
     refresh();
-  }
-
-  async function runGwCheck() {
-    setGwBusy(true);
-    setGwChecks(null);
-    const res = await api.checkGateway(gwUrl.trim() || undefined);
-    setGwBusy(false);
-    if (Array.isArray(res.checks)) {
-      setGwChecks(res.checks);
-      if (res.error) toast(res.error);
-    } else {
-      toast(res.error || "自检失败");
-    }
   }
 
   return (
     <>
-      <PageHead title="接入客户端" sub="代码工具直连 MCP；Gemini App 经 Cloudflare 网关接入。" />
+      <PageHead title="接入客户端" sub="代码工具直连 MCP；Gemini App 通过免 OAuth 密钥路径接入。" />
       <Block title="直连 MCP（代码工具）">
         <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,280px),1fr))] gap-x-7 gap-y-4">
           <FieldRow label="MCP 地址">
@@ -173,59 +166,49 @@ export function ConnectPage() {
         </div>
       </Block>
 
-      <Block title="Gemini App（Cloudflare 网关）" sub="Worker 承担公网 OAuth，/mcp 校验令牌后用 UPSTREAM_TOKEN 转发到本节点。">
-        <FieldRow label="网关地址">
-          <Input
-            value={gwUrl}
-            onChange={(e) => setGwUrl(e.target.value)}
-            placeholder="https://astra-gemini-gateway.<sub>.workers.dev"
-            className="max-w-[420px] font-mono text-xs"
-          />
-          <Button variant="outline" size="sm" onClick={saveGwUrl}>保存</Button>
-          <Button variant="outline" size="sm" disabled={gwBusy} onClick={runGwCheck}>
-            {gwBusy ? "自检中…" : "自检"}
-          </Button>
-        </FieldRow>
-        {gwChecks && (
-          <ul className="m-0 mt-2.5 list-none space-y-1 p-0 text-xs">
-            {gwChecks.map((c) => (
-              <li key={c.name} className={c.ok ? "text-live" : "text-destructive"}>
-                {c.ok ? "✓" : "✗"} {c.name}：{c.detail}
-              </li>
-            ))}
-          </ul>
-        )}
-        {gwBase && (
-          <div className="mt-3">
-            <FieldRow label="在 Gemini「设置 → Connected Apps → Add custom app」填写">
-              <MonoBox title={`${gwBase}/mcp`}>{gwBase}/mcp</MonoBox>
-              <CopyButton text={`${gwBase}/mcp`} message="已复制 Gemini MCP 地址" />
+      <Block title="Gemini App（免 OAuth 密钥路径）" sub="高熵路径本身就是凭据；Gemini Advanced 留空即可直连，无需 Cloudflare Worker 或 OAuth。">
+        <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+          <label className="flex cursor-pointer items-center gap-2.5 text-[13px]">
+            <Switch checked={mcpPathEnabled} onCheckedChange={(v) => void saveMcpPathEnabled(v)} />
+            启用免 OAuth 密钥路径
+          </label>
+          <span className={mcpPathEnabled ? "text-live text-xs" : "text-muted-foreground text-xs"}>
+            {mcpPathEnabled ? "已启用" : "已关闭（请求返回 404）"}
+          </span>
+        </div>
+        {geminiMcpUrl ? (
+          <>
+            <FieldRow label="在 Gemini「Settings → Connected Apps → Add custom app」填写">
+              <MaskedValue
+                visible={showMcpPath}
+                onToggle={() => setShowMcpPath((v) => !v)}
+                value={geminiMcpUrl}
+                emptyText="未配置 Gemini 路径密钥"
+                copyMessage="已复制 Gemini 免 OAuth MCP 地址"
+              />
             </FieldRow>
             <p className="text-muted-foreground mt-1.5 text-xs">
-              Advanced 留空；授权页口令见本机 deploy/local.json 的 gateway.accessPassword。
+              Advanced 留空；完整 URL 就是凭据，不要提交到 issue、日志或公开仓库。
             </p>
-          </div>
+            {!status.publicGeminiMcpUrl && mcpPathEnabled && (
+              <p className="text-warn mt-1.5 text-xs">
+                尚未在「星图组网」固定公网 publicUrl；请确认上方地址是 Gemini 云端可访问的公网 HTTPS 地址。
+              </p>
+            )}
+            {!mcpPathEnabled && (
+              <p className="text-muted-foreground mt-1.5 text-xs">
+                当前开关已关闭，Gemini 保存该 URL 后也会返回 404；重新开启即可恢复。
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="text-muted-foreground m-0 text-[13px]">
+            未检测到 mcp-path.txt。Docker 与 Windows 托盘首启会自动生成；手工启动时请先生成该文件并重启服务。
+          </p>
         )}
         <ol className="m-0 mt-4 list-decimal space-y-2.5 pl-5 text-[13px]">
-          <li>
-            在仓库根目录运行 <code className="font-mono">node deploy/gateway.mjs</code>
-            （首次需在 <code className="font-mono">gateway/cloudflare</code> 下{" "}
-            <code className="font-mono">npx wrangler login</code>）。
-          </li>
-          <li>
-            <code className="font-mono">UPSTREAM_MCP_URL</code> 填本节点公网 MCP 地址：
-            {status.publicMcpUrl ? (
-              <div className="mt-1 flex items-center gap-2">
-                <MonoBox title={status.publicMcpUrl}>{status.publicMcpUrl}</MonoBox>
-                <CopyButton text={status.publicMcpUrl} message="已复制公网 MCP 地址" />
-              </div>
-            ) : (
-              <span className="text-muted-foreground"> 需先在「星图组网」页配置「固定公网地址」</span>
-            )}
-          </li>
-          <li>
-            <code className="font-mono">UPSTREAM_TOKEN</code> 填本页「客户端 Token」。
-          </li>
+          <li>反向代理需转发 POST /mcp/*，并避免把完整密钥路径写入访问日志。</li>
+          <li>若 Gemini 不显示 Connected Apps，请使用英文界面、美国出口，并开启 Gemini Apps Activity。</li>
         </ol>
       </Block>
 

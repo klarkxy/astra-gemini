@@ -23,14 +23,26 @@ function Get-OrCreateToken([string]$fileName) {
   return (Get-Content -Path $file -Raw).Trim()
 }
 
-$token = Get-OrCreateToken "token.txt"
-$joinToken = Get-OrCreateToken "join-token.txt"
-$adminKey = Get-OrCreateToken "admin-key.txt"
+function Read-BridgeSecrets {
+  return @{
+    Token        = Get-OrCreateToken "token.txt"
+    JoinToken    = Get-OrCreateToken "join-token.txt"
+    AdminKey     = Get-OrCreateToken "admin-key.txt"
+    McpPathToken = Get-OrCreateToken "mcp-path.txt"
+  }
+}
+
+function Open-BridgeConsole {
+  $currentAdminKey = Get-OrCreateToken "admin-key.txt"
+  Start-Process "$UiUrl#k=$currentAdminKey"
+}
+
+$null = Read-BridgeSecrets
 
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, "Local\AstraGeminiTrayMutex", [ref]$createdNew)
 if (-not $createdNew) {
-  Start-Process "$UiUrl#k=$adminKey"
+  Open-BridgeConsole
   exit 0
 }
 
@@ -66,6 +78,7 @@ $notify.Visible = $true
 
 function Start-Bridge {
   if ($script:nodeProc -and -not $script:nodeProc.HasExited) { return }
+  $secrets = Read-BridgeSecrets
   $psi = New-Object System.Diagnostics.ProcessStartInfo
   $psi.FileName = "node"
   $psi.Arguments = "src/server.mjs"
@@ -75,9 +88,10 @@ function Start-Bridge {
   $psi.EnvironmentVariables["HOST"] = "127.0.0.1"
   $psi.EnvironmentVariables["PORT"] = "$Port"
   $psi.EnvironmentVariables["AUTH_MODE"] = "bearer"
-  $psi.EnvironmentVariables["ASTRA_TOKEN"] = $token
-  $psi.EnvironmentVariables["ASTRA_JOIN_TOKEN"] = $joinToken
-  $psi.EnvironmentVariables["ASTRA_ADMIN_KEY"] = $adminKey
+  $psi.EnvironmentVariables["ASTRA_TOKEN"] = $secrets.Token
+  $psi.EnvironmentVariables["ASTRA_JOIN_TOKEN"] = $secrets.JoinToken
+  $psi.EnvironmentVariables["ASTRA_ADMIN_KEY"] = $secrets.AdminKey
+  $psi.EnvironmentVariables["ASTRA_MCP_PATH_TOKEN"] = $secrets.McpPathToken
   $script:nodeProc = [System.Diagnostics.Process]::Start($psi)
   Update-TrayUi
 }
@@ -109,7 +123,7 @@ function Update-TrayUi {
   $itemToggle.Text = if ($running) { "停止服务" } else { "启动服务" }
 }
 
-$itemOpen.Add_Click({ Start-Process "$UiUrl#k=$adminKey" })
+$itemOpen.Add_Click({ Open-BridgeConsole })
 $itemToggle.Add_Click({
   if ($script:nodeProc -and -not $script:nodeProc.HasExited) { Stop-Bridge } else { Start-Bridge }
 })
@@ -118,11 +132,11 @@ $itemCopyUrl.Add_Click({
   $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制本机 MCP 地址", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $itemCopyToken.Add_Click({
-  [System.Windows.Forms.Clipboard]::SetText($token)
+  [System.Windows.Forms.Clipboard]::SetText((Get-OrCreateToken "token.txt"))
   $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制客户端 Token（/mcp Bearer 凭据）", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $itemCopyJoin.Add_Click({
-  [System.Windows.Forms.Clipboard]::SetText($joinToken)
+  [System.Windows.Forms.Clipboard]::SetText((Get-OrCreateToken "join-token.txt"))
   $notify.ShowBalloonTip(2000, "Astra Gemini", "已复制入网 Token（子节点 wss://<公网地址>/ws/tree 使用）", [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $itemOpenDir.Add_Click({ Start-Process explorer.exe $Root })
@@ -134,12 +148,12 @@ $itemExit.Add_Click({
 })
 
 $notify.ContextMenuStrip = $menu
-$notify.Add_DoubleClick({ Start-Process "$UiUrl#k=$adminKey" })
+$notify.Add_DoubleClick({ Open-BridgeConsole })
 
 Start-Bridge
 Start-Sleep -Milliseconds 600
 $notify.ShowBalloonTip(2500, "Astra Gemini 已启动", "双击托盘图标可随时打开星空双子座控制台。", [System.Windows.Forms.ToolTipIcon]::Info)
-Start-Process "$UiUrl#k=$adminKey"
+Open-BridgeConsole
 
 try {
   [System.Windows.Forms.Application]::Run()

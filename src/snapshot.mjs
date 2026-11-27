@@ -24,6 +24,38 @@ function matchesKnownHash(buf, sha256, knownHash) {
   return false;
 }
 
+function normalizeKnownHashes(input) {
+  let val = input;
+  if (typeof val === "string" && val.trim()) {
+    try {
+      val = JSON.parse(val);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(val)) {
+    const out = Object.create(null);
+    for (const item of val) {
+      if (item && typeof item === "object" && typeof item.path === "string" && typeof item.hash === "string" && item.hash) {
+        const rel = item.path.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+        if (rel) out[rel] = item.hash;
+      }
+    }
+    return out;
+  }
+  if (val && typeof val === "object") {
+    const out = Object.create(null);
+    for (const [k, v] of Object.entries(val)) {
+      if (typeof v === "string" && v) {
+        const rel = k.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
+        if (rel) out[rel] = v;
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
 function listFilesViaGit(rootDir) {
   const res = spawnSync(
     "git",
@@ -79,7 +111,7 @@ export function pullSnapshot(projectCfg, opts = {}) {
     Array.isArray(paths) && paths.length > 0
       ? paths
           .map((p) => {
-            const norm = p.replace(/\\/g, "/").replace(/^\.\//, "");
+            const norm = p.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
             if (!/[*?]/.test(norm) && !norm.includes(".")) {
               return [globToRegex(norm), globToRegex(`${norm.replace(/\/$/, "")}/**`)];
             }
@@ -88,10 +120,7 @@ export function pullSnapshot(projectCfg, opts = {}) {
           .flat()
       : null;
 
-  const knownMap =
-    knownHashes && typeof knownHashes === "object" && !Array.isArray(knownHashes)
-      ? knownHashes
-      : null;
+  const knownMap = normalizeKnownHashes(knownHashes);
 
   const files = [];
   const unchangedPaths = [];
@@ -166,7 +195,7 @@ export function pullSnapshot(projectCfg, opts = {}) {
   const deleted = [];
   if (knownMap) {
     for (const rawKey of Object.keys(knownMap)) {
-      const rel = rawKey.replace(/\\/g, "/").replace(/^\.\//, "");
+      const rel = rawKey.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
       if (filterRegexes && !filterRegexes.some((rx) => rx.test(rel))) continue;
       if (!seenPaths.has(rel)) {
         deleted.push(rel);

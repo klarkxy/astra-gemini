@@ -63,25 +63,12 @@ export interface Settings {
   nodeId?: string;
   publicUrl?: string;
   publicConsole?: boolean;
-  gatewayUrl?: string;
+  mcpPathEnabled?: boolean;
   directEnabled?: boolean;
   advertiseLan?: boolean;
   upstream?: { enabled?: boolean; url?: string; token?: string };
   tunnel?: { mode?: string; publicUrl?: string; hasToken?: boolean };
   [key: string]: unknown;
-}
-
-export interface GatewayCheckItem {
-  name: string;
-  ok: boolean;
-  detail: string;
-}
-
-export interface GatewayCheckResult {
-  ok?: boolean;
-  error?: string;
-  base?: string;
-  checks?: GatewayCheckItem[];
 }
 
 export interface LogEntry {
@@ -136,8 +123,11 @@ export interface StatusResponse {
   hasJoinToken: boolean;
   publicUrl: string;
   publicMcpUrl: string | null;
+  mcpPathToken?: string;
+  mcpPathEnabled?: boolean;
+  publicGeminiMcpUrl?: string | null;
   publicConsole: boolean;
-  rotatable?: { client?: boolean; join?: boolean; admin?: boolean };
+  rotatable?: { client?: boolean; join?: boolean; admin?: boolean; mcpPath?: boolean };
   uptimeSec: number;
   settings: Settings;
   projects: ProjectInfo[];

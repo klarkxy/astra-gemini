@@ -4,23 +4,24 @@
 
 **需要 Node.js ≥ 25**：`exec_verify` 脚本在 `node --permission` 权限模型沙箱中运行，Node 25 起该模型才支持网络限制（`--allow-net`），更早版本无法保证沙箱断网，因此整体要求 ≥ 25。
 
-典型场景：把一台或多台机器上的代码仓库暴露给 Claude.ai、ChatGPT 或其他 MCP 客户端——AI 拉快照、打补丁、跑白名单验证命令。
+典型场景：把一台或多台机器上的代码仓库暴露给 Gemini App、Claude Code、Cursor 或其他 MCP 客户端——AI 拉快照、打补丁、跑白名单验证命令。
 
 ## 快速开始
 
 1. 克隆或解压本仓库到任意目录。
-2. 右键 `install.ps1` → **使用 PowerShell 运行**：检查 Node/Git、生成两个 Token 文件、运行完整测试套件、创建桌面快捷方式。
+2. 右键 `install.ps1` → **使用 PowerShell 运行**：检查 Node/Git、生成密钥文件、运行完整测试套件、创建桌面快捷方式。
 3. 双击桌面「Astra Gemini」（或目录内 `Start-AstraGemini.vbs`）：托盘驻留并自动打开控制台 `http://127.0.0.1:3939/ui`（仅本机可访问）。
 
-安装目录下会生成三个密钥文件（均已 gitignore）：
+安装目录下会生成四个密钥文件（均已 gitignore）：
 
 | 文件 | 用途 |
 | --- | --- |
 | `token.txt` | **客户端 Token**：`/mcp` 的 Bearer 凭据 |
 | `join-token.txt` | **入网 Token**：仅供子节点通过 `wss://…/ws/tree` 挂载到本节点 |
 | `admin-key.txt` | **管理密钥**：本地控制台 `/api/*` 凭据（`X-Astra-Admin`），托盘打开控制台时自动携带 |
+| `mcp-path.txt` | **Gemini 路径密钥**：`/mcp/<64位密钥>` Capability URL 凭据 |
 
-三个密钥均可在控制台「接入客户端」页一键轮换：立即生效并写回密钥文件；仅当密钥来自文件（Docker 入口脚本或托盘生成）时可轮换，由环境变量直接固定的值需改环境变量后重启。
+四个密钥均可在控制台「接入客户端」页一键轮换：立即生效并写回密钥文件；仅当密钥来自文件（Docker 入口脚本或托盘生成）时可轮换，由环境变量直接固定的值需改环境变量后重启。
 
 控制台五个页签：SDK 能力开关 / 本地项目 / 星图组网 / 备份回滚 / 自检与日志。托盘菜单可复制本机 MCP 地址、客户端 Token、入网 Token。
 
@@ -29,6 +30,7 @@
 ## MCP 接口与工具
 
 - `POST /mcp`：JSON-RPC 2.0，单请求单响应（无 SSE）。认证为 `Authorization: Bearer <客户端 Token>`；未带凭据返回 401 并附 `WWW-Authenticate: Bearer realm="astra-gemini"`。
+- `POST /mcp/<mcpPathToken>`：Gemini 专用 Capability URL，高熵路径本身就是凭据，无需 Authorization/OAuth；密钥错误或控制台关闭 `mcpPathEnabled` 时一律返回 404。`GET`/`DELETE` 返回 405 与 `Allow: POST, OPTIONS`，`OPTIONS` 返回 204。
 - `WS /ws/tree`：子节点入网（仅入网 Token）。`WS /ws/direct`：节点间点对点直连（15 秒一次性票据）。`GET /health`：存活探测。
 - 项目寻址支持多级路径：本机项目写 `my-app`，子树项目写 `<节点Id>/<项目>`，更深层写 `<a>/<b>/<项目>`。
 
@@ -42,8 +44,8 @@
 
 补充说明：
 
-- `pull_snapshot` 的 `knownHashes` 传 `{相对路径: sha256或md5}`：哈希一致的文件只进 `unchangedPaths` 不重传内容；已消失的文件列入 `deleted`；`bundleSha256` 是全部纳入清单文件的确定性指纹。文件枚举优先走 git 清单，非 git 目录回退目录遍历，全程套用 deny 规则。
-- `apply_patch` 流程：可选校验 `patchSha256`（SHA-256 或 MD5，防传输截断）→ `expectedHashes` 乐观锁（值为 `null` 表示该文件必须不存在；32 位十六进制按 MD5、否则按 SHA-256 比对现网文件）→ `git apply --check` → 自动备份触及文件到 `.bridge-backup/<项目>/<backupId>` → `git apply`。成功后返回 `postHashes`（SHA-256，`null` 表示文件已删）可直接刷新缓存。补丁以 `git -c core.autocrlf=false apply` 应用，LF 内容逐字节落盘。`dryRun: true` 只校验不写入。
+- `pull_snapshot` 的 `knownHashes` 推荐传 `[{ path, hash }]`（`hash` 为 sha256 或 md5）：哈希一致的文件只进 `unchangedPaths` 不重传内容；已消失的文件列入 `deleted`；`bundleSha256` 是全部纳入清单文件的确定性指纹。旧版 `{相对路径: hash}` 字典及其 JSON 字符串仍兼容。文件枚举优先走 git 清单，非 git 目录回退目录遍历，全程套用 deny 规则。
+- `apply_patch` 流程：可选校验 `patchSha256`（SHA-256 或 MD5，防传输截断）→ `expectedHashes` 乐观锁（推荐 `[{ path, hash, exists }]`；`exists: false` 表示该文件必须不存在，`exists !== false` 时必须提供非空 `hash`，32 位十六进制按 MD5、否则按 SHA-256 比对现网文件；旧版 `{相对路径: hash|null}` 字典及其 JSON 字符串仍兼容，非法输入一律拒绝补丁）→ `git apply --check` → 自动备份触及文件到 `.bridge-backup/<项目>/<backupId>` → `git apply`。成功后返回 `postHashes`（SHA-256，`null` 表示文件已删）可直接刷新缓存。补丁以 `git -c core.autocrlf=false apply` 应用，LF 内容逐字节落盘。`dryRun: true` 只校验不写入。
 - `exec_verify` 在独立的 `node --permission` 子进程中执行：仅被授予读自身文件权限，无网络、写盘、子进程、Worker、原生扩展权限。脚本内仅暴露 `sdk` 命名空间、受限 console 与定时器；**所有 `sdk.*` 调用跨 IPC 边界、返回 Promise，必须 await**。示例：
 
   ```js
@@ -92,12 +94,13 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
 
 ## 安全模型
 
-- **两类凭据权限边界**：客户端 Token → `/mcp` 全部工具；入网 Token → 仅 `/ws/tree` 注册。两者互不相通（交叉使用均 401），比较均使用恒定时算法。
-- **重要**：拿到客户端 Token 的调用方，对每个 `mode: "direct"` 项目约等于拥有本机用户的代码执行能力——可先 `apply_patch` 修改 `package.json`，再 `exec_verify` 调 `sdk.npm.run` 执行。只给受信任的 AI/节点授权。
+- **凭据权限边界**：客户端 Token → `/mcp` 全部工具；Gemini 路径密钥 → `/mcp/<mcpPathToken>` 全部工具；入网 Token → 仅 `/ws/tree` 注册。三者互不相通（`/mcp` 交叉使用均 401；错误路径密钥一律 404），比较均使用恒定时算法。
+- `/mcp` 与 `/mcp/<mcpPathToken>` 校验浏览器 `Origin` 白名单：仅 `https://gemini.google.com`、已配置 `publicUrl` 的 origin 与 `ASTRA_MCP_ALLOWED_ORIGINS`（逗号分隔）中的条目可访问，其余携带 `Origin` 的请求一律 403；不带 `Origin` 的服务端客户端不受影响，CORS 只回显白名单内的 Origin，绝不使用 `*`。
+- **重要**：拿到客户端 Token 或完整 Gemini Capability URL 的调用方，对每个 `mode: "direct"` 项目约等于拥有本机用户的代码执行能力——可先 `apply_patch` 修改 `package.json`，再 `exec_verify` 调 `sdk.npm.run` 执行。只给受信任的 AI/节点授权；反向代理必须避免把 `/mcp/<密钥>` 完整路径写入访问日志。
 - `readonly` 仅阻止 `apply_patch` 写盘，**不阻止 `exec_verify`**（其后果取决于启用的 SDK，如 `npm run build` 仍会写产物）。需要严格只读时，请同时把项目 `sdks` 收缩为 `["fs_read"]` 等纯读集合——控制台「本地项目」页签的「严格只读预设」按钮可一键填入该组合。
 - 上级节点的 `/mcp` 凭据持有者可对整棵子树（含全部后代节点的项目）发起工具调用；入网 Token 只决定谁能挂载上来，不约束上级的调用能力。
 - `exec_verify` 沙箱边界：独立 `node --permission` 子进程，仅 `--allow-fs-read` 自身文件；SDK 调用经宿主端白名单校验的 IPC 代理，返回值 JSON 序列化。已知残余风险：`process.kill`/`process.abort` 不受权限模型管控（脚本可终止自身或信号同用户进程）；CPU/内存仅靠超时兜底（默认 30s、上限 120s）。
-- 管理控制台（`/ui`、`/api/*`）只接受本机 socket，且校验 Host（仅 `127.0.0.1`/`localhost`/`::1`）、Origin 必须同源、拒绝 `Sec-Fetch-Site: cross-site`（防 DNS rebinding 与跨站提交）。经公网入口到达的管理请求一律 403。`/api/*` 另需 `X-Astra-Admin` 管理密钥（`ASTRA_ADMIN_KEY` 或 `admin-key.txt`；未配置时 bearer 模式回退为客户端 Token；`AUTH_MODE=none` 不校验），防本机其他进程/用户伪造管理请求。桥接器密钥文件（`token.txt`、`join-token.txt`、`admin-key.txt`、`identity.json`、`settings.json`、`nodes.json`）创建时及每次启动均收紧 ACL 至仅当前用户可读写（Windows icacls / POSIX 0600）。
+- 管理控制台（`/ui`、`/api/*`）只接受本机 socket，且校验 Host（仅 `127.0.0.1`/`localhost`/`::1`）、Origin 必须同源、拒绝 `Sec-Fetch-Site: cross-site`（防 DNS rebinding 与跨站提交）。经公网入口到达的管理请求一律 403。`/api/*` 另需 `X-Astra-Admin` 管理密钥（`ASTRA_ADMIN_KEY` 或 `admin-key.txt`；未配置时 bearer 模式回退为客户端 Token；`AUTH_MODE=none` 不校验），防本机其他进程/用户伪造管理请求。桥接器密钥文件（`token.txt`、`join-token.txt`、`admin-key.txt`、`mcp-path.txt`、`identity.json`、`settings.json`、`nodes.json`）创建时及每次启动均收紧 ACL 至仅当前用户可读写（Windows icacls / POSIX 0600）。
 - 节点 TOFU 绑定：子节点首次注册将 `nodeId → sha256(nodeSecret)` 落盘 `nodes.json`；此后同名不同密的连接被 `1008` 拒绝且不顶替现有连接，控制台「星图组网」可一键移除重置。
 - 直连票据 15 秒一次性单用；心跳每 25 秒一次、超过 75 秒无应答断开并自动重连（退避重试，成功即重置）。
 - **远程直达信任边界**：P2P 监听端口（默认 3940）的入站 socket 必须在 5 秒内发送带已知会话 ID 的 `ASTRA-P2P/1 <sid>` 前导行，未知 sid 立即断开，对扫描器不暴露 TLS；随后建立 TLS 1.3 双向认证并把对端证书 SPKI 锁定到 `ag1-` 节点地址（`identity.json` 中的 Ed25519 密钥决定地址）。
@@ -136,29 +139,27 @@ SDK 生效 = 全局开关（`settings.globalSdkEnabled`，控制台页签热生�
 
 ### 连接 AI 客户端
 
-代码工具（Claude Code、Codex、Cursor 等）直连：MCP 地址填 `<公网地址或本机地址>/mcp`，认证用请求头 `Authorization: Bearer <客户端 Token>`（`token.txt`），控制台「接入客户端」页有一键复制的命令与 `mcp.json` 片段。claude.ai / ChatGPT 的网页端 connector 要求服务端提供 OAuth，本项目的内置 OAuth 已移除，这类客户端不再支持直连；Gemini App 请走下一节的 Cloudflare 网关。
+代码工具（Claude Code、Codex、Cursor 等）直连：MCP 地址填 `<公网地址或本机地址>/mcp`，认证用请求头 `Authorization: Bearer <客户端 Token>`（`token.txt`），控制台「接入客户端」页有一键复制的命令与 `mcp.json` 片段。claude.ai / ChatGPT 的网页端 connector 要求服务端提供 OAuth，本项目的内置 OAuth 已移除，这类客户端不再支持直连。
 
-### Gemini 接入（Cloudflare 网关）
+### Gemini 接入（免 OAuth 密钥路径）
 
-Gemini App（gemini.google.com 的 custom apps）对接本机内置 OAuth 时，实测授权页 302 回跳后 Google 始终没有调用 `/oauth/token`（原因未定位），内置 OAuth 现已移除；`gateway/cloudflare/` 改用 Cloudflare 官方的 `@cloudflare/workers-oauth-provider` 做公网 OAuth 前置：Worker 承担授权服务器 + 受保护资源两个角色，`/mcp` 校验令牌后用静态 Bearer（`UPSTREAM_TOKEN`，即 VPS 的 `/data/token.txt`）转发到 `UPSTREAM_MCP_URL`（如 `https://astra.example.com/mcp`），VPS 侧 astra-gemini 无需改动。免费额度足够个人使用：Workers Free 每天 10 万次请求，KV 免费写入每天 1000 次（仅授权/刷新令牌时写入）。
+Gemini App 推荐使用内置 Capability URL，无需 Cloudflare Worker、OAuth 或 Advanced 配置：
 
-部署（需 Cloudflare 账号；首次在 `gateway/cloudflare` 下 `npx wrangler login` 一次）：
+1. 先配置固定公网地址 `publicUrl`（例如 `https://astra.example.com`），并确认反向代理把 `POST /mcp/*` 转发到本节点。`deploy/Caddyfile` 示例已包含 `log_skip /mcp/*`，避免完整密钥路径进入访问日志。
+2. 打开控制台「接入客户端」页，确认「启用免 OAuth 密钥路径」已开启，复制 **Gemini 免 OAuth MCP 地址**：`https://<域名>/mcp/<64位路径密钥>`。
+3. 在 Gemini `Settings → Connected Apps → Add custom app` 填入该完整 URL，Advanced 留空保存。工具列表应出现 `list_projects`、`pull_snapshot`、`apply_patch`、`list_sdks`、`exec_verify`。
+4. 完整 URL 就是凭据；轮换「Gemini 路径密钥」后旧 URL 立即返回 404，`/mcp` 的 Bearer 客户端 Token 不受影响。
+
+Docker 入口脚本、Windows 安装脚本与托盘会自动生成 `mcp-path.txt`。若用 systemd 等方式手工启动且该文件不存在，可先生成再启动：
 
 ```bash
-node deploy/gateway.mjs
+node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))' > mcp-path.txt
+chmod 600 mcp-path.txt
 ```
 
-脚本自动完成：`npm ci` → KV 命名空间复用/创建并回填 `wrangler.jsonc` → `wrangler deploy` → 经 SSH 读取 VPS `/data/token.txt` 写入 `UPSTREAM_TOKEN` secret → 生成 `ACCESS_PASSWORD`（保存到 `deploy/local.json`，不回显）→ 把网关地址注册进节点 `settings.gatewayUrl` → OAuth 全链路冒烟（授权码 + PKCE + token 交换 + MCP initialize/tools/list）。可选参数：`--upstream <mcpUrl>` 改写 `UPSTREAM_MCP_URL`、`--secrets-only` 只更新 secrets（客户端 Token 轮换后用）、`--rotate-password` 重新生成授权页口令、`--no-smoke`、`--dry-run`。
+Gemini custom apps 官方要求：美国地区、18+、个人账号（非 Workspace）、界面语言英语、开启 Gemini Apps Activity 历史记录。若保存后工具不加载，先确认浏览器访问 Google 服务走美国出口，再检查密钥路径是否被反向代理改写或日志重定向。
 
-Gemini 里 MCP 地址填 `https://<worker>.workers.dev/mcp`，「Advanced」留空即可（DCR 自动注册仅接受 Google 回调域名的 `/r/`、`/a/` 路径；授权页口令即 `ACCESS_PASSWORD`）。若 DCR 不通走手动凭据：从 Gemini 页面复制它要用的 redirect URI，`curl -X POST https://<worker>.workers.dev/admin/clients -H "Authorization: Bearer <ACCESS_PASSWORD>" -H "Content-Type: application/json" -d '{"redirect_uris":["<该URI>"]}'` 拿 `client_id`/`client_secret` 填入「Advanced」。
-
-排障：`npx wrangler tail` 实时看每请求一行的 JSON 日志与 OAuth 错误内部原因；`PUBLIC_ORIGIN`（wrangler.jsonc vars）仅在请求 Host 与对外地址不一致时填写。
-
-注意事项：
-
-- workers.dev 域名在国内可能需经代理访问（Gemini 授权时浏览器会打开网关的口令页）。
-- 该库每次 refresh 会轮换 refresh token（上一个在新 token 首次使用前仍有效）；Google 文档建议不轮换，最坏情况是偶发需要重新授权一次。
-- Gemini custom apps 官方要求：美国地区、18+、个人账号（非 Workspace）、界面语言英语、开启 Gemini Apps Activity 历史记录。
+项目已移除旧版 Cloudflare OAuth 网关；Gemini 接入只需要上述内置 Capability URL。
 
 ### 子节点入网
 
@@ -187,7 +188,7 @@ A、B 是两台各自运行 astra-gemini 的机器。A 本机的 AI 客户端连
 
 ## Docker 部署
 
-镜像基于 `node:26-bookworm-slim`，运行时数据全部落在 `/data` 卷（`settings.json`、`projects.json`、三个 Token 文件等），`/workspace/demo` 挂载演示项目 `docker/demo/`。Token 未通过环境变量提供时由入口脚本自动生成并持久化到 `/data`。
+镜像基于 `node:26-bookworm-slim`，运行时数据全部落在 `/data` 卷（`settings.json`、`projects.json`、四把密钥文件等），`/workspace/demo` 挂载演示项目 `docker/demo/`。Token 未通过环境变量提供时由入口脚本自动生成并持久化到 `/data`。
 
 ```bash
 docker compose build
@@ -202,22 +203,22 @@ ASTRA_HOST_PORT=13939 docker compose up -d   # 宿主机端口默认 3939，可�
 | `ASTRA_NODE_ID` | 固定节点名（默认取容器 hostname）；**仅首次启动播种**，之后以控制台设置为准 |
 | `ASTRA_PUBLIC_URL` | 公网地址，如 `https://astra.example.com`（VPS 节点必填）；仅作回退，控制台 `publicUrl` 优先 |
 | `ASTRA_UPSTREAM_URL` / `ASTRA_UPSTREAM_TOKEN` | 子节点入网：`wss://<父节点域名>/ws/tree` + 父节点入网 Token；**仅首次启动播种** |
+| `ASTRA_MCP_PATH_TOKEN` | 可选：固定 Gemini 路径密钥；缺省时入口脚本生成/读取 `/data/mcp-path.txt` |
+| `ASTRA_MCP_ALLOWED_ORIGINS` | 可选：额外允许访问 `/mcp` 的浏览器 Origin，逗号分隔（尾随 `/` 自动忽略） |
 
 VPS 侧与方案 A 等价：`.env` 设 `ASTRA_PUBLIC_URL=https://<域名>`，Caddy `reverse_proxy 127.0.0.1:3939`。本地子节点 `.env` 设 `ASTRA_UPSTREAM_URL=wss://<域名>/ws/tree` 与 `ASTRA_UPSTREAM_TOKEN=<父节点 join-token>`，经父节点访问其项目写作 `<nodeId>/<project>`（如 `home-docker/demo`）。容器内 UPnP 与 LAN 直连宣告会被强制关闭，树内调用自动走中继。
 
-查看 Token：`docker exec astra-gemini cat /data/token.txt`（`join-token.txt` / `admin-key.txt` 同理）。注意 `/ui` 管理控制台只接受回环 socket，宿主机直接访问映射端口会 403；管理操作用 `docker exec` 或 SSH 端口转发。冒烟验证：`docker exec astra-gemini node /app/docker/verify.mjs http://127.0.0.1:3939/mcp <Token> <project>`。
+查看 Token：`docker exec astra-gemini cat /data/token.txt`（`join-token.txt` / `admin-key.txt` / `mcp-path.txt` 同理）。注意 `/ui` 管理控制台只接受回环 socket，宿主机直接访问映射端口会 403；管理操作用 `docker exec` 或 SSH 端口转发。冒烟验证：`docker exec astra-gemini node /app/docker/verify.mjs http://127.0.0.1:3939/mcp <Token> <project>`。
 
 ### 一键部署（deploy/*.mjs）
 
-零依赖 Node 脚本，参数只需首次提供，之后缓存在 `deploy/local.json`（已 gitignore，内含授权口令与冒烟客户端凭据，勿提交）：
+零依赖 Node 脚本，参数只需首次提供，之后缓存在 `deploy/local.json`（已 gitignore，勿提交）：
 
 ```bash
 node deploy/vps.mjs --host <ssh别名>      # = npm run deploy:vps -- --host <ssh别名>
-node deploy/gateway.mjs                   # = npm run deploy:gateway
 ```
 
-- `deploy/vps.mjs`：`--host`（必需，可缓存）、`--dir`（默认 `/opt/astra-gemini`）、`--dry-run`、`--skip-web-check`、`--no-smoke`、`--verify-project`（默认 `demo`）。流程：预检本机/远端 docker 与架构 → 校验 `src/ui.html` 不比 `web/` 源码旧 → 本机 `docker build --platform` → 镜像 Id 一致即跳过传输，否则 `docker save | gzip | ssh 'gunzip | docker load'` → 远端沿用其 compose 文件（从容器 label 读取，**不上传/覆盖 VPS 的 compose 与 .env**）`up -d --no-build` → 等健康检查 ≤90s → 容器内 `verify.mjs` 冒烟。
-- `deploy/gateway.mjs`：见上文「Gemini 接入」。两个脚本任何一步失败均以非零码退出并输出中文原因。
+- `deploy/vps.mjs`：`--host`（必需，可缓存）、`--dir`（默认 `/opt/astra-gemini`）、`--dry-run`、`--skip-web-check`、`--no-smoke`、`--verify-project`（默认 `demo`）。流程：预检本机/远端 docker 与架构 → 校验 `src/ui.html` 不比 `web/` 源码旧 → 本机 `docker build --platform` → 镜像 Id 一致即跳过传输，否则 `docker save | gzip | ssh 'gunzip | docker load'` → 远端沿用其 compose 文件（从容器 label 读取，**不上传/覆盖 VPS 的 compose 与 .env**）`up -d --no-build` → 等健康检查 ≤90s → 容器内 `verify.mjs` 冒烟。任何一步失败均以非零码退出并输出中文原因。
 
 ## 本地状态文件
 
@@ -227,7 +228,7 @@ node deploy/gateway.mjs                   # = npm run deploy:gateway
 | --- | --- |
 | `settings.json` | `nodeId`、`nodeSecret`、上游/隧道 Token、`publicUrl`、SDK 与直连开关（含敏感信息） |
 | `projects.json` | 项目注册表（见上文） |
-| `token.txt` / `join-token.txt` / `admin-key.txt` | 客户端 Token / 入网 Token / 管理密钥 |
+| `token.txt` / `join-token.txt` / `admin-key.txt` / `mcp-path.txt` | 客户端 Token / 入网 Token / 管理密钥 / Gemini 路径密钥 |
 | `nodes.json` | 子节点 TOFU 绑定（`nodeId → sha256(nodeSecret)`） |
 | `identity.json` | Ed25519 节点密钥对（`ag1-` 地址的来源；私钥泄露=节点身份被冒充） |
 | `.bridge-backup/` | `apply_patch` 自动备份，供回滚 |
@@ -237,7 +238,7 @@ node deploy/gateway.mjs                   # = npm run deploy:gateway
 
 ## 开发与测试
 
-`npm test`（即 `node --test test/bridge.test.mjs`，node:test 零依赖）覆盖：单节点工具链与项目防火墙、快照去重与补丁完整性/gzip、沙箱逃逸防护、直连升级与中继回退、Token 隔离、TOFU 劫持与重置、`/mcp` Bearer 认证与 OAuth 端点 404、心跳重连、跨节点超时。网关端到端用例：`cd gateway/cloudflare && npm test`（拉起本地 `wrangler dev` 与上游桩）。
+`npm test`（即 `node --test test/bridge.test.mjs`，node:test 零依赖）覆盖：单节点工具链与项目防火墙、快照去重与补丁完整性/gzip、沙箱逃逸防护、直连升级与中继回退、Token 隔离、TOFU 劫持与重置、`/mcp` Bearer 认证、Gemini Schema/协议合规、双格式哈希锁、Capability URL 开关与轮换、心跳重连、跨节点超时。
 
 ## 开发控制台
 

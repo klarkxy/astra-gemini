@@ -1,6 +1,5 @@
 import type {
   EnvItem,
-  GatewayCheckResult,
   RemoteStatus,
   StatusResponse
 } from "./types";
@@ -107,10 +106,8 @@ export const api = {
     req<ApiResult>("POST", "/api/tunnel/config", body),
   saveSettings: (body: Record<string, unknown>) =>
     req<ApiResult>("POST", "/api/settings", body),
-  rotateSecret: (kind: "client" | "join" | "admin") =>
+  rotateSecret: (kind: "client" | "join" | "admin" | "mcpPath") =>
     req<ApiResult & { kind?: string; value?: string }>("POST", "/api/secrets/rotate", { kind }),
-  checkGateway: (url?: string) =>
-    req<GatewayCheckResult>("POST", "/api/gateway/check", url ? { url } : {}),
   saveRendezvous: (body: { enabled: boolean; url: string; token?: string }) =>
     req<ApiResult>("POST", "/api/rendezvous", body),
   saveRemoteAlias: (alias: string, address: string | null) =>
