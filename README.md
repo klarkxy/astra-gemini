@@ -45,7 +45,7 @@
 补充说明：
 
 - `pull_snapshot` 的 `knownHashes` 推荐传 `[{ path, hash }]`（`hash` 为 sha256 或 md5）：哈希一致的文件只进 `unchangedPaths` 不重传内容；已消失的文件列入 `deleted`；`bundleSha256` 是全部纳入清单文件的确定性指纹。旧版 `{相对路径: hash}` 字典及其 JSON 字符串仍兼容。文件枚举优先走 git 清单，非 git 目录回退目录遍历，全程套用 deny 规则。
-- `apply_patch` 流程：可选校验 `patchSha256`（SHA-256 或 MD5，防传输截断）→ `expectedHashes` 乐观锁（推荐 `[{ path, hash, exists }]`；`exists: false` 或空 `hash` 表示该文件必须不存在，32 位十六进制按 MD5、否则按 SHA-256 比对现网文件；旧版 `{相对路径: hash|null}` 字典及其 JSON 字符串仍兼容）→ `git apply --check` → 自动备份触及文件到 `.bridge-backup/<项目>/<backupId>` → `git apply`。成功后返回 `postHashes`（SHA-256，`null` 表示文件已删）可直接刷新缓存。补丁以 `git -c core.autocrlf=false apply` 应用，LF 内容逐字节落盘。`dryRun: true` 只校验不写入。
+- `apply_patch` 流程：可选校验 `patchSha256`（SHA-256 或 MD5，防传输截断）→ `expectedHashes` 乐观锁（推荐 `[{ path, hash, exists }]`；`exists: false` 表示该文件必须不存在，`exists !== false` 时必须提供非空 `hash`，32 位十六进制按 MD5、否则按 SHA-256 比对现网文件；旧版 `{相对路径: hash|null}` 字典及其 JSON 字符串仍兼容，非法输入一律拒绝补丁）→ `git apply --check` → 自动备份触及文件到 `.bridge-backup/<项目>/<backupId>` → `git apply`。成功后返回 `postHashes`（SHA-256，`null` 表示文件已删）可直接刷新缓存。补丁以 `git -c core.autocrlf=false apply` 应用，LF 内容逐字节落盘。`dryRun: true` 只校验不写入。
 - `exec_verify` 在独立的 `node --permission` 子进程中执行：仅被授予读自身文件权限，无网络、写盘、子进程、Worker、原生扩展权限。脚本内仅暴露 `sdk` 命名空间、受限 console 与定时器；**所有 `sdk.*` 调用跨 IPC 边界、返回 Promise，必须 await**。示例：
 
   ```js

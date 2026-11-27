@@ -87,14 +87,14 @@ const TOOLS = [
         patchSha256: { type: "string", description: "Optional SHA-256 (or MD5) hex checksum of the patch text." },
         expectedHashes: {
           type: "array",
-          description: "Optional optimistic lock entries; rejects patch if local files diverged.",
+          description: "Optional optimistic lock entries; rejects patch if local files diverged. Omit to skip locking; invalid values fail closed.",
           items: {
             type: "object",
             required: ["path"],
             properties: {
               path: { type: "string", description: "Project-relative file path." },
-              hash: { type: "string", description: "Expected SHA-256 or MD5 hex digest before patching." },
-              exists: { type: "boolean", description: "Set false to assert a newly created file does not exist yet (default true)." }
+              hash: { type: "string", description: "Expected non-empty SHA-256 or MD5 hex digest before patching (required unless `exists` is false)." },
+              exists: { type: "boolean", description: "Set false to assert a newly created file does not exist yet (default true; when not false, `hash` is required)." }
             }
           }
         },
@@ -131,32 +131,90 @@ const TOOLS = [
   }
 ];
 
+function mergeHeadersWithVary(baseHeaders = {}, extraHeaders = {}) {
+  const merged = {};
+  const varyTokens = [];
+  const seenVary = new Set();
+  const addVary = (raw) => {
+    if (raw === undefined || raw === null) return;
+    const parts = Array.isArray(raw) ? raw : [raw];
+    for (const part of parts) {
+      for (const token of String(part).split(",")) {
+        const trimmed = token.trim();
+        if (!trimmed) continue;
+        if (trimmed === "*") {
+          varyTokens.length = 0;
+          varyTokens.push("*");
+          seenVary.clear();
+          seenVary.add("*");
+          return;
+        }
+        const lower = trimmed.toLowerCase();
+        if (!seenVary.has("*") && !seenVary.has(lower)) {
+          seenVary.add(lower);
+          varyTokens.push(trimmed);
+        }
+      }
+    }
+  };
+  for (const [k, v] of Object.entries(baseHeaders)) {
+    if (v === undefined) continue;
+    if (k.toLowerCase() === "vary") addVary(v);
+    else merged[k] = v;
+  }
+  for (const [k, v] of Object.entries(extraHeaders)) {
+    if (v === undefined) continue;
+    if (k.toLowerCase() === "vary") addVary(v);
+    else merged[k] = v;
+  }
+  if (varyTokens.length > 0) {
+    merged.Vary = varyTokens.join(", ");
+  }
+  return merged;
+}
+
+function isJsonContentType(headerVal) {
+  if (typeof headerVal !== "string") return false;
+  const mediaType = headerVal.split(";")[0].trim().toLowerCase();
+  return mediaType === "application/json" || (mediaType.startsWith("application/") && mediaType.endsWith("+json"));
+}
+
 function sendJson(req, res, status, obj, extraHeaders = {}) {
   const rawBuf = Buffer.from(JSON.stringify(obj), "utf8");
   const acceptEnc = String(req?.headers?.["accept-encoding"] || "");
   if (rawBuf.length > 1024 && /\bgzip\b/i.test(acceptEnc)) {
     const gz = zlib.gzipSync(rawBuf, { level: 6 });
-    res.writeHead(status, {
-      "Content-Type": "application/json; charset=utf-8",
-      "Content-Encoding": "gzip",
-      Vary: "Accept-Encoding",
-      "Content-Length": gz.length,
-      ...extraHeaders
-    });
+    res.writeHead(
+      status,
+      mergeHeadersWithVary(
+        {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Encoding": "gzip",
+          Vary: "Accept-Encoding",
+          "Content-Length": gz.length
+        },
+        extraHeaders
+      )
+    );
     res.end(gz);
     return;
   }
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": rawBuf.length,
-    ...extraHeaders
-  });
+  res.writeHead(
+    status,
+    mergeHeadersWithVary(
+      {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": rawBuf.length
+      },
+      extraHeaders
+    )
+  );
   res.end(rawBuf);
 }
 
 function sendRaw(req, res, status, bodyText, extraHeaders = {}) {
   if (!bodyText) {
-    res.writeHead(status, { "Content-Length": 0, ...extraHeaders });
+    res.writeHead(status, mergeHeadersWithVary({ "Content-Length": 0 }, extraHeaders));
     res.end();
     return;
   }
@@ -164,21 +222,31 @@ function sendRaw(req, res, status, bodyText, extraHeaders = {}) {
   const acceptEnc = String(req?.headers?.["accept-encoding"] || "");
   if (rawBuf.length > 1024 && /\bgzip\b/i.test(acceptEnc)) {
     const gz = zlib.gzipSync(rawBuf, { level: 6 });
-    res.writeHead(status, {
-      "Content-Type": "application/json; charset=utf-8",
-      "Content-Encoding": "gzip",
-      Vary: "Accept-Encoding",
-      "Content-Length": gz.length,
-      ...extraHeaders
-    });
+    res.writeHead(
+      status,
+      mergeHeadersWithVary(
+        {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Encoding": "gzip",
+          Vary: "Accept-Encoding",
+          "Content-Length": gz.length
+        },
+        extraHeaders
+      )
+    );
     res.end(gz);
     return;
   }
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": rawBuf.length,
-    ...extraHeaders
-  });
+  res.writeHead(
+    status,
+    mergeHeadersWithVary(
+      {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": rawBuf.length
+      },
+      extraHeaders
+    )
+  );
   res.end(rawBuf);
 }
 
@@ -507,7 +575,16 @@ export function createBridgeServer(options = {}) {
     } catch (err) {
       return respond(400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } });
     }
-    const { id = null, method, params } = msg || {};
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+      return respond(400, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+    }
+    const hasId = Object.hasOwn(msg, "id");
+    const validId = !hasId || typeof msg.id === "string" || typeof msg.id === "number" || msg.id === null;
+    if (!validId) {
+      return respond(400, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+    }
+    const id = hasId ? msg.id : null;
+    const { method, params } = msg;
     const mcpProtocolVersion = headers["mcp-protocol-version"];
     if (method !== "initialize" && mcpProtocolVersion !== undefined && !SUPPORTED_MCP_VERSIONS.includes(mcpProtocolVersion)) {
       return respond(400, {
@@ -516,7 +593,15 @@ export function createBridgeServer(options = {}) {
         error: { code: -32600, message: `Unsupported MCP-Protocol-Version: ${mcpProtocolVersion}` }
       });
     }
-    if (method === "notifications/initialized" || (id === null && method?.startsWith("notifications/"))) {
+    const isClientResponse =
+      !Object.hasOwn(msg, "method") && (Object.hasOwn(msg, "result") || Object.hasOwn(msg, "error"));
+    if (isClientResponse) {
+      return { status: 202, headers: {}, bodyText: "" };
+    }
+    if (typeof method !== "string" || !method) {
+      return respond(400, { jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request" } });
+    }
+    if (!hasId) {
       return { status: 202, headers: {}, bodyText: "" };
     }
     try {
@@ -1022,11 +1107,22 @@ export function createBridgeServer(options = {}) {
       return;
     }
 
+    if (!isJsonContentType(req.headers["content-type"])) {
+      sendJson(
+        req,
+        res,
+        415,
+        { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request: Content-Type must be application/json." } },
+        mcpCorsHeaders(req)
+      );
+      return;
+    }
+
     let mcpBody;
     try {
       mcpBody = await readBody(req);
     } catch (err) {
-      sendJson(req, res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } });
+      sendJson(req, res, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } }, mcpCorsHeaders(req));
       return;
     }
     const mcpRes = await handleMcp({
@@ -1034,7 +1130,7 @@ export function createBridgeServer(options = {}) {
       bodyText: mcpBody,
       preAuthorized: isPathSecretMcp
     });
-    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, { ...mcpCorsHeaders(req), ...mcpRes.headers });
+    sendRaw(req, res, mcpRes.status, mcpRes.bodyText, mergeHeadersWithVary(mcpCorsHeaders(req), mcpRes.headers));
   });
 
   serverRef = server;

@@ -11,6 +11,7 @@ import zlib from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBridgeServer } from "../src/server.mjs";
+import { normalizeExpectedHashes } from "../src/patch.mjs";
 import { PROTOCOL_VERSION } from "../src/tree.mjs";
 import { acceptWebSocketUpgrade, connectWebSocket } from "../src/ws.mjs";
 import { loadIdentity } from "../src/identity.mjs";
@@ -2566,6 +2567,282 @@ test("settings.publicUrl takes precedence over ASTRA_PUBLIC_URL env", async () =
   } finally {
     if (prevEnv === undefined) delete process.env.ASTRA_PUBLIC_URL;
     else process.env.ASTRA_PUBLIC_URL = prevEnv;
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+
+function rawHttpRequest(port, reqPath, { method = "POST", headers = {}, body = "" } = {}) {
+  return new Promise((resolve, reject) => {
+    const buf = Buffer.from(body, "utf8");
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: reqPath,
+        method,
+        headers: {
+          "Content-Length": buf.length,
+          ...headers
+        }
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const rawBuf = Buffer.concat(chunks);
+          const enc = res.headers["content-encoding"] || "";
+          const text = enc === "gzip" ? zlib.gunzipSync(rawBuf).toString("utf8") : rawBuf.toString("utf8");
+          resolve({ status: res.statusCode, headers: res.headers, rawBytes: rawBuf.length, text });
+        });
+      }
+    );
+    req.on("error", reject);
+    if (buf.length > 0) req.write(buf);
+    req.end();
+  });
+}
+
+test("MCP Vary header merging: allowed Origin + gzip preserves both Accept-Encoding and Origin", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-vary-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+  const secret = "d".repeat(64);
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "vary-node",
+    authMode: "bearer",
+    authToken: "vary-tok",
+    mcpPathToken: secret
+  });
+  await listenOn(server);
+  const { port } = server.address();
+
+  try {
+    for (const [reqPath, authHeaders] of [
+      ["/mcp", { Authorization: "Bearer vary-tok" }],
+      [`/mcp/${secret}`, {}]
+    ]) {
+      const gzRes = await rawHttpRequest(port, reqPath, {
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://gemini.google.com",
+          "Accept-Encoding": "gzip",
+          ...authHeaders
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+      });
+      assert.equal(gzRes.status, 200);
+      assert.equal(gzRes.headers["content-encoding"], "gzip");
+      assert.equal(gzRes.headers["access-control-allow-origin"], "https://gemini.google.com");
+      assert.equal(gzRes.headers["vary"], "Accept-Encoding, Origin");
+      assert.equal(JSON.parse(gzRes.text).result.tools.length, 5);
+
+      const smallRes = await rawHttpRequest(port, reqPath, {
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://gemini.google.com",
+          "Accept-Encoding": "gzip",
+          ...authHeaders
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" })
+      });
+      assert.equal(smallRes.status, 200);
+      assert.equal(smallRes.headers["content-encoding"], undefined);
+      assert.equal(smallRes.headers["vary"], "Origin");
+    }
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("MCP JSON-RPC 2.0 hygiene: non-object/batch -32600, hasOwn id notifications 202, Content-Type enforcement", async () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-rpc-hygiene-"));
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  fs.writeFileSync(path.join(bridgeState, "projects.json"), "{}", "utf8");
+  const secret = "e".repeat(64);
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    nodeId: "rpc-hygiene",
+    authMode: "bearer",
+    authToken: "rpc-tok",
+    mcpPathToken: secret
+  });
+  await listenOn(server);
+  const { port } = server.address();
+
+  try {
+    // (c) Top-level null, [], batch array, primitives, and methodless object return 400 + -32600
+    for (const rawBody of [
+      "null",
+      "[]",
+      JSON.stringify([{ jsonrpc: "2.0", id: 1, method: "ping" }]),
+      "123",
+      "true",
+      JSON.stringify("hello"),
+      "{}",
+      JSON.stringify({ jsonrpc: "2.0", id: 1 })
+    ]) {
+      const res = await rawHttpRequest(port, `/mcp/${secret}`, {
+        headers: { "Content-Type": "application/json" },
+        body: rawBody
+      });
+      assert.equal(res.status, 400, `expected 400 for body ${rawBody}`);
+      const parsed = JSON.parse(res.text);
+      assert.equal(parsed.jsonrpc, "2.0");
+      assert.equal(parsed.error.code, -32600, `expected -32600 for body ${rawBody}`);
+    }
+
+    // Notifications without "id" (and client responses without "method") return 202 empty body
+    for (const notifObj of [
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 9 } },
+      { jsonrpc: "2.0", method: "custom/progress", params: {} },
+      { jsonrpc: "2.0", id: 99, result: {} }
+    ]) {
+      const res = await rawHttpRequest(port, `/mcp/${secret}`, {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(notifObj)
+      });
+      assert.equal(res.status, 202);
+      assert.equal(res.headers["content-length"], "0");
+      assert.equal(res.text, "");
+    }
+
+    // Explicit "id": null is treated as a normal request, NOT a notification
+    const nullIdPing = await rawHttpRequest(port, `/mcp/${secret}`, {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: null, method: "ping" })
+    });
+    assert.equal(nullIdPing.status, 200);
+    assert.deepEqual(JSON.parse(nullIdPing.text), { jsonrpc: "2.0", id: null, result: {} });
+
+    const nullIdUnknown = await rawHttpRequest(port, `/mcp/${secret}`, {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: null, method: "notifications/initialized" })
+    });
+    assert.equal(nullIdUnknown.status, 200);
+    const nullIdUnknownJson = JSON.parse(nullIdUnknown.text);
+    assert.equal(nullIdUnknownJson.id, null);
+    assert.equal(nullIdUnknownJson.error.code, -32601);
+
+    // (d) Non-JSON or missing Content-Type is rejected on both /mcp and /mcp/<secret>
+    const validBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" });
+    for (const [reqPath, authHeaders] of [
+      ["/mcp", { Authorization: "Bearer rpc-tok" }],
+      [`/mcp/${secret}`, {}]
+    ]) {
+      for (const ctHeaders of [
+        {},
+        { "Content-Type": "text/plain" },
+        { "Content-Type": "application/x-www-form-urlencoded" }
+      ]) {
+        const badCt = await rawHttpRequest(port, reqPath, {
+          headers: { Origin: "https://gemini.google.com", ...authHeaders, ...ctHeaders },
+          body: validBody
+        });
+        assert.equal(badCt.status, 415);
+        assert.equal(badCt.headers["access-control-allow-origin"], "https://gemini.google.com");
+        assert.equal(JSON.parse(badCt.text).error.code, -32600);
+      }
+
+      const okCharset = await rawHttpRequest(port, reqPath, {
+        headers: { "Content-Type": "application/json; charset=utf-8", ...authHeaders },
+        body: validBody
+      });
+      assert.equal(okCharset.status, 200);
+    }
+
+    // Wrong capability secret still returns 404 before Content-Type check; unauth /mcp returns 401 first
+    const wrongCapPlain = await rawHttpRequest(port, `/mcp/${"f".repeat(64)}`, {
+      headers: { "Content-Type": "text/plain" },
+      body: validBody
+    });
+    assert.equal(wrongCapPlain.status, 404);
+
+    const unauthPlain = await rawHttpRequest(port, "/mcp", {
+      headers: { "Content-Type": "text/plain" },
+      body: validBody
+    });
+    assert.equal(unauthPlain.status, 401);
+  } finally {
+    server.close();
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test("expectedHashes strict fail-closed validation and multi-prefix ././ path normalization", async () => {
+  assert.equal(normalizeExpectedHashes(undefined), null);
+  assert.equal(normalizeExpectedHashes(null), null);
+  for (const invalid of ["", "   ", 123, 0, true, false, "123", "true", "null", '"str"', { "app.js": "" }, { "app.js": 123 }]) {
+    assert.throws(() => normalizeExpectedHashes(invalid), /Invalid expectedHashes/);
+  }
+
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "astra-lock-strict-"));
+  const repo = path.join(tmpBase, "repo");
+  const bridgeState = makeTempBridgeRoot(tmpBase, "bridge");
+  initTempGitRepo(repo);
+
+  const projectsConfig = path.join(bridgeState, "projects.json");
+  fs.writeFileSync(projectsConfig, JSON.stringify({ demo: { root: repo, mode: "direct", sdks: ["git"] } }), "utf8");
+
+  const server = createBridgeServer({
+    bridgeRoot: bridgeState,
+    projectsConfigPath: projectsConfig,
+    nodeId: "strict-lock",
+    authMode: "bearer",
+    authToken: "strict-tok"
+  });
+  await listenOn(server);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const patch = "--- a/app.js\n+++ b/app.js\n@@ -1 +1 @@\n-export const answer = 41;\n+export const answer = 99;\n";
+
+  try {
+    for (const badLock of ["", "   ", 123, true, "123", "null", { "app.js": "" }]) {
+      const res = (await rpc(base, "strict-tok", "tools/call", {
+        name: "apply_patch",
+        arguments: { project: "demo", patch, expectedHashes: badLock }
+      })).body.result;
+      assert.equal(res.isError, true, `expected isError for expectedHashes=${JSON.stringify(badLock)}`);
+      assert.match(res.content[0].text, /Invalid expectedHashes/);
+    }
+    // Verify file on disk was never modified when invalid expectedHashes rejected the patch
+    assert.equal(fs.readFileSync(path.join(repo, "app.js"), "utf8"), "export const answer = 41;\n");
+
+    // Multi-layer ././ prefix normalization in snapshot knownHashes and patch expectedHashes
+    const snap0 = (await rpc(base, "strict-tok", "tools/call", {
+      name: "pull_snapshot",
+      arguments: { project: "demo", paths: ["././app.js"], includeContent: false }
+    })).body.result.structuredContent;
+    assert.equal(snap0.files.length, 1);
+    const appSha = snap0.files[0].sha256;
+
+    const snapDedup = (await rpc(base, "strict-tok", "tools/call", {
+      name: "pull_snapshot",
+      arguments: {
+        project: "demo",
+        includeContent: false,
+        knownHashes: [{ path: "././app.js", hash: appSha }, { path: "././gone.js", hash: "0".repeat(64) }]
+      }
+    })).body.result.structuredContent;
+    assert.ok(snapDedup.unchangedPaths.includes("app.js"));
+    assert.deepEqual(snapDedup.deleted, ["gone.js"]);
+
+    const okMultiDot = (await rpc(base, "strict-tok", "tools/call", {
+      name: "apply_patch",
+      arguments: {
+        project: "demo",
+        patch,
+        expectedHashes: [{ path: "././app.js", hash: appSha }],
+        dryRun: true
+      }
+    })).body.result.structuredContent;
+    assert.equal(okMultiDot.ok, true, okMultiDot.error);
+  } finally {
     server.close();
     fs.rmSync(tmpBase, { recursive: true, force: true });
   }

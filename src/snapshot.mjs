@@ -37,7 +37,7 @@ function normalizeKnownHashes(input) {
     const out = Object.create(null);
     for (const item of val) {
       if (item && typeof item === "object" && typeof item.path === "string" && typeof item.hash === "string" && item.hash) {
-        const rel = item.path.replace(/\\/g, "/").replace(/^\.\//, "");
+        const rel = item.path.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
         if (rel) out[rel] = item.hash;
       }
     }
@@ -47,7 +47,7 @@ function normalizeKnownHashes(input) {
     const out = Object.create(null);
     for (const [k, v] of Object.entries(val)) {
       if (typeof v === "string" && v) {
-        const rel = k.replace(/\\/g, "/").replace(/^\.\//, "");
+        const rel = k.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
         if (rel) out[rel] = v;
       }
     }
@@ -111,7 +111,7 @@ export function pullSnapshot(projectCfg, opts = {}) {
     Array.isArray(paths) && paths.length > 0
       ? paths
           .map((p) => {
-            const norm = p.replace(/\\/g, "/").replace(/^\.\//, "");
+            const norm = p.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
             if (!/[*?]/.test(norm) && !norm.includes(".")) {
               return [globToRegex(norm), globToRegex(`${norm.replace(/\/$/, "")}/**`)];
             }
@@ -195,7 +195,7 @@ export function pullSnapshot(projectCfg, opts = {}) {
   const deleted = [];
   if (knownMap) {
     for (const rawKey of Object.keys(knownMap)) {
-      const rel = rawKey.replace(/\\/g, "/").replace(/^\.\//, "");
+      const rel = rawKey.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "");
       if (filterRegexes && !filterRegexes.some((rx) => rx.test(rel))) continue;
       if (!seenPaths.has(rel)) {
         deleted.push(rel);
